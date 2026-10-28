@@ -626,7 +626,12 @@ PlusStatus vtkPlusNDITracker::InternalStopRecording()
   else { result = PLUS_FAIL; }
   this->IsDeviceTracking = 0;
   if (!this->RawStartupError.empty()) { result = PLUS_FAIL; }
-  if (this->RawSender && !this->RawSender->Stop("SOURCE_STOP")) { result = PLUS_FAIL; }
+  if (this->RawSender && !this->RawSender->Stop("SOURCE_STOP"))
+  {
+    LOG_ERROR("Raw export finalized incomplete: " << this->RawSender->Error()
+              << ". This is export completeness, not a serial tracking-thread failure.");
+    result = PLUS_FAIL;
+  }
   // Always finalize, including a missing/closed device. Storage status is separate.
   if (this->MarkerRecorder && !this->MarkerRecorder->Stop(this->RawSnapshotFailed?"raw snapshot allocation failure":""))
   {

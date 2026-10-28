@@ -18,6 +18,10 @@ See License.txt for details.
 #include "PlusReusableServerSocket.h"
 #include <cerrno>
 #include <cstring>
+#include <cmath>
+#if defined(__linux__)
+#include <time.h>
+#endif
 #include "vtkIGSIORecursiveCriticalSection.h"
 #include "vtkIGSIOTrackedFrameList.h"
 #include "vtkIGSIOTransformRepository.h"
@@ -430,6 +434,7 @@ PlusStatus vtkPlusOpenIGTLinkServer::SendLatestFramesToClients(vtkPlusOpenIGTLin
 {
   vtkSmartPointer<vtkIGSIOTrackedFrameList> trackedFrameList = vtkSmartPointer<vtkIGSIOTrackedFrameList>::New();
   double startTimeSec = vtkIGSIOAccurateTimer::GetSystemTime();
+  self.UpdateBroadcastDiagnostics(startTimeSec);
 
   // Acquire tracked frames since last acquisition (minimum 1 frame)
   if (self.LastProcessingTimePerFrameMs < 1)
@@ -447,13 +452,15 @@ PlusStatus vtkPlusOpenIGTLinkServer::SendLatestFramesToClients(vtkPlusOpenIGTLin
         || (self.BroadcastChannel->ToolCount() > 0 && !self.BroadcastChannel->GetTrackingDataAvailable())
         || (self.BroadcastChannel->FieldCount() > 0 && !self.BroadcastChannel->GetFieldDataAvailable()))
     {
-      if (self.LogWarningOnNoDataAvailable)
+      if (self.LogWarningOnNoDataAvailable && !self.NoDataAvailableReported)
       {
-        LOG_DYNAMIC("No data is broadcasted, as no data is available yet.", self.GracePeriodLogLevel);
+        LOG_DEBUG("No data is broadcasted; waiting for input (repeated messages suppressed).");
       }
+      self.NoDataAvailableReported = true;
     }
     else
     {
+      self.NoDataAvailableReported = false;
       double oldestDataTimestamp = 0;
       if (self.BroadcastChannel->GetOldestTimestamp(oldestDataTimestamp) == PLUS_SUCCESS)
       {
@@ -486,6 +493,11 @@ PlusStatus vtkPlusOpenIGTLinkServer::SendLatestFramesToClients(vtkPlusOpenIGTLin
     return PLUS_FAIL;
   }
 
+  if (self.BroadcastDiagnosticsIntervalSec > 0)
+  {
+    self.DiagnosticsFrames += trackedFrameList->GetNumberOfTrackedFrames();
+    self.DiagnosticsMaxBatch = std::max<unsigned long long>(self.DiagnosticsMaxBatch, trackedFrameList->GetNumberOfTrackedFrames());
+  }
   for (unsigned int i = 0; i < trackedFrameList->GetNumberOfTrackedFrames(); ++i)
   {
     // Send tracked frame
@@ -502,6 +514,38 @@ PlusStatus vtkPlusOpenIGTLinkServer::SendLatestFramesToClients(vtkPlusOpenIGTLin
     self.LastProcessingTimePerFrameMs = computationTimeMs / trackedFrameList->GetNumberOfTrackedFrames();
   }
   return PLUS_SUCCESS;
+}
+
+//----------------------------------------------------------------------------
+void vtkPlusOpenIGTLinkServer::UpdateBroadcastDiagnostics(double now)
+{
+  if (this->BroadcastDiagnosticsIntervalSec <= 0) { return; }
+  if (this->DiagnosticsLastEmit == 0) { this->DiagnosticsLastEmit = now; }
+  if (this->DiagnosticsLastCycle > 0)
+  {
+    this->DiagnosticsMaxLoopGapSec = std::max(this->DiagnosticsMaxLoopGapSec, now - this->DiagnosticsLastCycle);
+  }
+  this->DiagnosticsLastCycle = now;
+  ++this->DiagnosticsCycles;
+  if (now - this->DiagnosticsLastEmit < this->BroadcastDiagnosticsIntervalSec) { return; }
+  unsigned long long monotonicNs = 0;
+#if defined(__linux__)
+  timespec clockValue{};
+  if (clock_gettime(CLOCK_MONOTONIC, &clockValue) == 0)
+  { monotonicNs = static_cast<unsigned long long>(clockValue.tv_sec) * 1000000000ULL + clockValue.tv_nsec; }
+#endif
+  LOG_INFO("TRANSFORM broadcast diagnostics: port=" << this->ListeningPort
+           << " source_monotonic_ns=" << monotonicNs << " window_s=" << now - this->DiagnosticsLastEmit
+           << " cycles=" << this->DiagnosticsCycles << " retrieved_frames=" << this->DiagnosticsFrames
+           << " max_batch_frames=" << this->DiagnosticsMaxBatch << " complete_messages=" << this->DiagnosticsMessages
+           << " complete_bytes=" << this->DiagnosticsBytes << " failed_send_calls=" << this->DiagnosticsSendFailures
+           << " send_and_retry_ms=" << this->DiagnosticsSendSec * 1000
+           << " max_send_and_retry_ms=" << this->DiagnosticsMaxSendSec * 1000
+           << " max_broadcast_loop_gap_ms=" << this->DiagnosticsMaxLoopGapSec * 1000);
+  this->DiagnosticsLastEmit = now;
+  this->DiagnosticsCycles = this->DiagnosticsFrames = this->DiagnosticsMaxBatch = 0;
+  this->DiagnosticsMessages = this->DiagnosticsBytes = this->DiagnosticsSendFailures = 0;
+  this->DiagnosticsMaxLoopGapSec = this->DiagnosticsSendSec = this->DiagnosticsMaxSendSec = 0;
 }
 
 //----------------------------------------------------------------------------
@@ -1091,7 +1135,16 @@ PlusStatus vtkPlusOpenIGTLinkServer::SendTrackedFrame(igsioTrackedFrame& tracked
         }
 
         int retValue = 0;
+        const double sendStarted = this->BroadcastDiagnosticsIntervalSec > 0 ? vtkIGSIOAccurateTimer::GetSystemTime() : 0;
         RETRY_UNTIL_TRUE((retValue = clientSocket->Send(igtlMessage->GetBufferPointer(), igtlMessage->GetBufferSize())) != 0, this->NumberOfRetryAttempts, this->DelayBetweenRetryAttemptsSec);
+        if (this->BroadcastDiagnosticsIntervalSec > 0)
+        {
+          const double duration = vtkIGSIOAccurateTimer::GetSystemTime() - sendStarted;
+          this->DiagnosticsSendSec += duration;
+          this->DiagnosticsMaxSendSec = std::max(this->DiagnosticsMaxSendSec, duration);
+          if (retValue == 0) { ++this->DiagnosticsSendFailures; }
+          else { ++this->DiagnosticsMessages; this->DiagnosticsBytes += igtlMessage->GetBufferSize(); }
+        }
         if (retValue == 0)
         {
           disconnectedClientIds.push_back(clientIterator->ClientId);
@@ -1285,6 +1338,8 @@ PlusStatus vtkPlusOpenIGTLinkServer::ReadConfiguration(vtkXMLDataElement* server
   XML_READ_SCALAR_ATTRIBUTE_REQUIRED(int, ListeningPort, serverElement);
   XML_READ_STRING_ATTRIBUTE_REQUIRED(OutputChannelId, serverElement);
   XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(double, MissingInputGracePeriodSec, serverElement);
+  XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(double, BroadcastDiagnosticsIntervalSec, serverElement);
+  if (!std::isfinite(this->BroadcastDiagnosticsIntervalSec) || this->BroadcastDiagnosticsIntervalSec < 0) { return PLUS_FAIL; }
   XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(double, MaxTimeSpentWithProcessingMs, serverElement);
   XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, MaxNumberOfIgtlMessagesToSend, serverElement);
   XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, NumberOfRetryAttempts, serverElement);

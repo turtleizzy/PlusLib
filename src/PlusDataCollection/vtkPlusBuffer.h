@@ -371,6 +371,9 @@ protected:
 
   char* DescriptiveName;
 
+  // Protected by StreamBuffer lock. One diagnostic per invalid-data episode.
+  bool InvalidInterpolationReported = false;
+
 private:
   vtkPlusBuffer(const vtkPlusBuffer&);
   void operator=(const vtkPlusBuffer&);

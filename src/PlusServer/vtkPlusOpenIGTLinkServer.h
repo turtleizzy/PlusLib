@@ -202,6 +202,7 @@ protected:
   vtkGetMacroConst(IgtlMessageCrcCheckEnabled, bool);
 
   vtkSetMacro(LogWarningOnNoDataAvailable, bool);
+  vtkSetMacro(BroadcastDiagnosticsIntervalSec, double);
   vtkGetMacroConst(LogWarningOnNoDataAvailable, bool);
 
   vtkSetMacro(MaxNumberOfIgtlMessagesToSend, int);
@@ -334,6 +335,15 @@ private:
   static const float CLIENT_SOCKET_TIMEOUT_SEC;
 
   bool NewClientConnected;
+  bool NoDataAvailableReported = false;
+
+  // Optional aggregate diagnostics, owned only by the broadcast worker.
+  void UpdateBroadcastDiagnostics(double now);
+  double BroadcastDiagnosticsIntervalSec = 0;
+  double DiagnosticsLastEmit = 0, DiagnosticsLastCycle = 0;
+  double DiagnosticsMaxLoopGapSec = 0, DiagnosticsSendSec = 0, DiagnosticsMaxSendSec = 0;
+  unsigned long long DiagnosticsCycles = 0, DiagnosticsFrames = 0, DiagnosticsMaxBatch = 0;
+  unsigned long long DiagnosticsMessages = 0, DiagnosticsBytes = 0, DiagnosticsSendFailures = 0;
 };
 
 #endif

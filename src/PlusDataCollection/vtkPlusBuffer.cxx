@@ -1197,7 +1197,11 @@ PlusStatus vtkPlusBuffer::GetPrevNextBufferItemFromTime(double time, StreamBuffe
   if (itemA.GetStatus() != TOOL_OK)
   {
     // tracker is out of view, ...
-    LOCAL_LOG_DEBUG("vtkPlusBuffer: Cannot do data interpolation. The closest item to the requested time (time: " << std::fixed << time << ", uid: " << itemAuid << ") is invalid.");
+    if (!this->InvalidInterpolationReported)
+    {
+      LOCAL_LOG_DEBUG("No usable transform for interpolation; waiting for a valid tool sample (repeated messages suppressed).");
+      this->InvalidInterpolationReported = true;
+    }
     return PLUS_FAIL;
   }
 
@@ -1214,6 +1218,7 @@ PlusStatus vtkPlusBuffer::GetPrevNextBufferItemFromTime(double time, StreamBuffe
   {
     //No need for interpolation, it's very close to the closest element
     itemB.DeepCopy(&itemA);
+    this->InvalidInterpolationReported = false;
     return PLUS_SUCCESS;
   }
 
@@ -1266,10 +1271,15 @@ PlusStatus vtkPlusBuffer::GetPrevNextBufferItemFromTime(double time, StreamBuffe
   // If there is no valid element on the other side of the requested time, then we cannot do an interpolation
   if (itemB.GetStatus() != TOOL_OK)
   {
-    LOCAL_LOG_DEBUG("vtkPlusBuffer: Cannot get a second element (uid=" << itemBuid << ") on the other side of the requested time (" << std::fixed << time << ")");
+    if (!this->InvalidInterpolationReported)
+    {
+      LOCAL_LOG_DEBUG("No usable transform for interpolation; waiting for a valid tool sample (repeated messages suppressed).");
+      this->InvalidInterpolationReported = true;
+    }
     return PLUS_FAIL;
   }
 
+  this->InvalidInterpolationReported = false;
   return PLUS_SUCCESS;
 }
 
