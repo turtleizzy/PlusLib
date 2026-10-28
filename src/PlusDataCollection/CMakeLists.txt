@@ -426,10 +426,12 @@ IF(PLUS_USE_NDI)
 
   SET(NDICAPI_SRCS
     NDICAPITracking/vtkPlusNDITracker.cxx
+    NDICAPITracking/PlusNDIMarkerRecorder.cxx
     )
 
   SET(NDICAPI_HDRS
     NDICAPITracking/vtkPlusNDITracker.h
+    NDICAPITracking/PlusNDIMarkerRecorder.h
     )
 
   LIST(APPEND ${PROJECT_NAME}_HDRS

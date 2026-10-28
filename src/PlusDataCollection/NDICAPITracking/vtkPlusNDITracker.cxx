@@ -44,6 +44,8 @@ POSSIBILITY OF SUCH DAMAGES.
 #include "vtkIGSIORecursiveCriticalSection.h"
 #include "vtkPlusDataSource.h"
 #include "vtkPlusNDITracker.h"
+#include "PlusNDIMarkerRecorder.h"
+#include <sys/stat.h>
 
 // NDI includes
 #include <ndicapi.h>
@@ -82,7 +84,17 @@ vtkStandardNewMacro(vtkPlusNDITracker);
 
 //----------------------------------------------------------------------------
 vtkPlusNDITracker::vtkPlusNDITracker()
-  : LastFrameNumber(0)
+  : EnableMeasuredMarkers(false)
+  , MarkerQueueCapacity(64)
+  , MarkerReplyTimeoutMs(5000)
+  , MarkerConnectionEpoch(0)
+  , MarkerPollSequence(0)
+  , MarkerErrorReported(false)
+  , MarkerRequestUnsupported(false)
+  , MarkerTransportDesynchronized(false)
+  , MarkerRecorder(nullptr)
+  , MarkerReply(nullptr)
+  , LastFrameNumber(0)
   , Device(nullptr)
   , SerialDevice("")
   , SerialPort(-1)
@@ -120,6 +132,8 @@ vtkPlusNDITracker::~vtkPlusNDITracker()
     delete [] toolDescriptorIt->second.VirtualSROM;
     toolDescriptorIt->second.VirtualSROM = NULL;
   }
+  if (this->MarkerRecorder) { this->MarkerRecorder->Stop(); delete this->MarkerRecorder; }
+  delete this->MarkerReply;
   this->CommandMutex->Delete();
   this->CommandMutex = nullptr;
 }
@@ -327,6 +341,12 @@ PlusStatus vtkPlusNDITracker::InternalConnect()
   }
 
   GetFirmwareRevision();
+  if (this->EnableMeasuredMarkers && this->FirmwareMajorRevision >= 3)
+  {
+    LOG_ERROR("Measured markers require the supported legacy BX serial path; BX2 is not implemented.");
+    CloseDevice(this->Device);
+    return PLUS_FAIL;
+  }
 
   SelectDataAveraging();
 
@@ -339,6 +359,12 @@ PlusStatus vtkPlusNDITracker::InternalConnect()
     return PLUS_FAIL;
   }
 
+  if (this->EnableMeasuredMarkers)
+  {
+    ++this->MarkerConnectionEpoch;
+    this->MarkerRequestUnsupported = false;
+    this->MarkerTransportDesynchronized = false;
+  }
   return PLUS_SUCCESS;
 }
 
@@ -477,6 +503,13 @@ PlusStatus vtkPlusNDITracker::InternalConnectNetwork()
 //----------------------------------------------------------------------------
 PlusStatus vtkPlusNDITracker::InternalDisconnect()
 {
+  PlusStatus result = PLUS_SUCCESS;
+  if (this->MarkerRecorder && !this->MarkerRecorder->Stop())
+  {
+    result = PLUS_FAIL;
+    LOG_ERROR("Measured marker sidecar did not close completely: " << this->MarkerRecorder->Error());
+  }
+  if (!this->Device) { return result; }
   for (NdiToolDescriptorsType::iterator toolDescriptorIt = this->NdiToolDescriptors.begin(); toolDescriptorIt != this->NdiToolDescriptors.end(); ++toolDescriptorIt)
   {
     this->ClearVirtualSromInTracker(toolDescriptorIt->second);
@@ -493,7 +526,7 @@ PlusStatus vtkPlusNDITracker::InternalDisconnect()
   }
   CloseDevice(this->Device);
 
-  return PLUS_SUCCESS;
+  return result;
 }
 
 
@@ -505,11 +538,32 @@ PlusStatus vtkPlusNDITracker::InternalStartRecording()
     return PLUS_SUCCESS;
   }
 
+  if (this->EnableMeasuredMarkers)
+  {
+    if (this->MarkerTransportDesynchronized || (this->Device && this->Device->BxCaptureSynchronization < 0))
+    {
+      LOG_ERROR("BX stream requires disconnect/reconnect and initialization before restarting capture.");
+      return PLUS_FAIL;
+    }
+    if (!this->MarkerRecorder) { this->MarkerRecorder = new PlusNDIMarkerRecorder; }
+    if (!this->MarkerReply) { this->MarkerReply = new ndiBXCapture; }
+    std::string error;
+    if (!this->MarkerRecorder->Start(this->MarkerSidecarDirectory, this->GetToolReferenceFrameName(),
+        this->MarkerQueueCapacity, this->AcquisitionRate, this->BaudRate, error, ndiGetSerialDeviceName(this->Device)))
+    {
+      LOG_ERROR("Cannot start measured marker sidecar: " << error);
+      return PLUS_FAIL;
+    }
+    this->MarkerPollSequence = 0;
+    this->MarkerErrorReported = false;
+    LOG_INFO("Measured marker sidecar: " << this->MarkerRecorder->Directory());
+  }
   this->Command("TSTART:");
   int errnum = ndiGetError(this->Device);
   if (errnum)
   {
     LOG_ERROR("Failed TSTART: " << ndiErrorString(errnum));
+    if (this->MarkerRecorder) { this->MarkerRecorder->Stop("TSTART failed"); }
     CloseDevice(this->Device);
     return PLUS_FAIL;
   }
@@ -522,20 +576,50 @@ PlusStatus vtkPlusNDITracker::InternalStartRecording()
 //----------------------------------------------------------------------------
 PlusStatus vtkPlusNDITracker::InternalStopRecording()
 {
-  if (this->Device == 0)
+  PlusStatus result = PLUS_SUCCESS;
+  if (this->Device)
   {
-    return PLUS_FAIL;
+    if (this->IsDeviceTracking)
+    {
+      this->Command("TSTOP:");
+      int errnum = ndiGetError(this->Device);
+      if (errnum) { LOG_ERROR(ndiErrorString(errnum)); result = PLUS_FAIL; }
+    }
   }
-
-  this->Command("TSTOP:");
-  int errnum = ndiGetError(this->Device);
-  if (errnum)
-  {
-    LOG_ERROR(ndiErrorString(errnum));
-  }
+  else { result = PLUS_FAIL; }
   this->IsDeviceTracking = 0;
+  // Always finalize, including a missing/closed device. Storage status is separate.
+  if (this->MarkerRecorder && !this->MarkerRecorder->Stop())
+  {
+    LOG_ERROR("Measured marker archive is incomplete: " << this->MarkerRecorder->Error());
+    result = PLUS_FAIL;
+  }
+  return result;
+}
 
-  return PLUS_SUCCESS;
+// Base Disconnect discards its InternalDisconnect result; keep the correction
+// local to this tracker. Repeated public Stop/Disconnect must retain archive failure.
+PlusStatus vtkPlusNDITracker::StopRecording()
+{
+  PlusStatus result = this->Superclass::StopRecording();
+  if (this->MarkerRecorder && !this->MarkerRecorder->Stop()) { result = PLUS_FAIL; }
+  return result;
+}
+PlusStatus vtkPlusNDITracker::Disconnect()
+{
+  PlusStatus result = PLUS_SUCCESS;
+  if (this->Recording && this->StopRecording() != PLUS_SUCCESS) { result = PLUS_FAIL; }
+  if (this->Superclass::Disconnect() != PLUS_SUCCESS) { result = PLUS_FAIL; }
+  if (this->MarkerRecorder && !this->MarkerRecorder->Stop()) { result = PLUS_FAIL; }
+  return result;
+}
+std::string vtkPlusNDITracker::GetMeasuredMarkerStorageState() const
+{
+  return this->MarkerRecorder ? this->MarkerRecorder->StorageState() : "never_started";
+}
+std::string vtkPlusNDITracker::GetMeasuredMarkerStorageError() const
+{
+  return this->MarkerRecorder ? this->MarkerRecorder->Error() : std::string();
 }
 
 //----------------------------------------------------------------------------
@@ -547,6 +631,7 @@ PlusStatus vtkPlusNDITracker::InternalUpdate()
     return PLUS_FAIL;
   }
 
+  if (this->EnableMeasuredMarkers && (this->MarkerRequestUnsupported || this->MarkerTransportDesynchronized)) { return PLUS_FAIL; }
   if (this->FirmwareMajorRevision < 3)
   {
     return this->DoBXUpdate();
@@ -1022,6 +1107,29 @@ PlusStatus vtkPlusNDITracker::ReadConfiguration(vtkXMLDataElement* rootConfigEle
   XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, NetworkPort, deviceConfig);
   XML_READ_BOOL_ATTRIBUTE_OPTIONAL(CheckDSR, deviceConfig);
 
+  XML_READ_BOOL_ATTRIBUTE_OPTIONAL(EnableMeasuredMarkers, deviceConfig);
+  XML_READ_STRING_ATTRIBUTE_OPTIONAL(MarkerSidecarDirectory, deviceConfig);
+  XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, MarkerQueueCapacity, deviceConfig);
+  XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, MarkerReplyTimeoutMs, deviceConfig);
+  if (this->EnableMeasuredMarkers)
+  {
+#if !defined(__linux__)
+    LOG_ERROR("Measured marker capture currently supports Linux serial only.");
+    return PLUS_FAIL;
+#endif
+    struct stat directoryStatus;
+    if (!this->NetworkHostname.empty() || this->MarkerSidecarDirectory.empty() ||
+        this->MarkerSidecarDirectory[0] != '/' ||
+        stat(this->MarkerSidecarDirectory.c_str(), &directoryStatus) != 0 ||
+        !S_ISDIR(directoryStatus.st_mode) || this->MarkerQueueCapacity < 1 ||
+        this->MarkerQueueCapacity > 1024 || this->MarkerReplyTimeoutMs < 50 ||
+        this->MarkerReplyTimeoutMs > 60000)
+    {
+      LOG_ERROR("Measured markers require serial, an existing absolute sidecar directory, queue 1..1024, timeout 50..60000 ms.");
+      return PLUS_FAIL;
+    }
+  }
+
   XML_FIND_NESTED_ELEMENT_REQUIRED(dataSourcesElement, deviceConfig, "DataSources");
 
   for (int nestedElementIndex = 0; nestedElementIndex < dataSourcesElement->GetNumberOfNestedElements(); nestedElementIndex++)
@@ -1066,6 +1174,7 @@ PlusStatus vtkPlusNDITracker::ReadConfiguration(vtkXMLDataElement* rootConfigEle
     NdiToolDescriptor toolDescriptor;
     toolDescriptor.PortEnabled = false;
     toolDescriptor.PortHandle = 0;
+    toolDescriptor.MarkerBodyFrame = toolId;
     toolDescriptor.VirtualSROM = NULL;
     toolDescriptor.WiredPortNumber = wiredPortNumber;
 
@@ -1078,6 +1187,16 @@ PlusStatus vtkPlusNDITracker::ReadConfiguration(vtkXMLDataElement* rootConfigEle
         LOG_WARNING("NDI PortName and RomFile are both specified for tool " << toolSourceId << ". Assuming broken wired rom, using virtual rom instead");
       }
       std::string romFilePath = vtkPlusConfig::GetInstance()->GetDeviceSetConfigurationPath(romFileName);
+      if (this->EnableMeasuredMarkers)
+      {
+        toolDescriptor.MarkerRomPath = romFilePath;
+        if (!PlusNDIMarkerRecorder::IdentifyRom(romFilePath, toolDescriptor.MarkerRomMD5,
+            toolDescriptor.MarkerRomBytes))
+        {
+          LOG_ERROR("Cannot identify original ROM for measured marker capture: " << romFilePath);
+          return PLUS_FAIL;
+        }
+      }
       this->ReadSromFromFile(toolDescriptor, romFilePath.c_str());
     }
 
@@ -1096,6 +1215,13 @@ PlusStatus vtkPlusNDITracker::WriteConfiguration(vtkXMLDataElement* rootConfig)
     trackerConfig->SetIntAttribute("SerialPort", this->SerialPort);
   }
 
+  if (this->EnableMeasuredMarkers)
+  {
+    trackerConfig->SetAttribute("EnableMeasuredMarkers", "true");
+    trackerConfig->SetAttribute("MarkerSidecarDirectory", this->MarkerSidecarDirectory.c_str());
+    trackerConfig->SetIntAttribute("MarkerQueueCapacity", this->MarkerQueueCapacity);
+    trackerConfig->SetIntAttribute("MarkerReplyTimeoutMs", this->MarkerReplyTimeoutMs);
+  }
   XML_WRITE_STRING_ATTRIBUTE_IF_NOT_EMPTY(NetworkHostname, trackerConfig);
   if (!this->NetworkHostname.empty())
   {
@@ -1550,11 +1676,49 @@ PlusStatus vtkPlusNDITracker::DoBXUpdate()
 {
   int errnum = 0;
   // get the transforms for all tools from the NDI
-  this->Command("BX:0801");
-  errnum = ndiGetError(this->Device);
+  std::vector<PlusNDIMarkerBinding> markerBindings;
+  if (this->EnableMeasuredMarkers)
+  {
+    for (const auto& entry : this->NdiToolDescriptors)
+    {
+      PlusNDIMarkerBinding b;
+      b.Handle = entry.second.PortHandle;
+      b.TransformName = entry.first;
+      b.BodyFrame = entry.second.MarkerBodyFrame;
+      b.RomPath = entry.second.MarkerRomPath;
+      b.RomMD5 = entry.second.MarkerRomMD5;
+      b.RomBytes = entry.second.MarkerRomBytes;
+      markerBindings.push_back(b);
+    }
+    {
+      igsioLockGuard<vtkIGSIORecursiveCriticalSection> lock(this->CommandMutex);
+      errnum = ndiCaptureBX(this->Device, NDI_BX_CAPTURE_FLAGS, this->MarkerReplyTimeoutMs, this->MarkerReply);
+    }
+    ++this->MarkerPollSequence;
+    if (this->MarkerReply->transport_state == NDI_BX_RECONNECT_REQUIRED)
+    {
+      this->MarkerTransportDesynchronized = true;
+      LOG_ERROR("BX stream is desynchronized; subsequent marker requests are inhibited until reconnect.");
+    }
+    if (errnum == 1 || errnum == 7)
+    {
+      this->MarkerRequestUnsupported = true;
+      LOG_ERROR("Device rejected BX marker capture; no fallback or derived coordinates will be used.");
+    }
+  }
+  else
+  {
+    this->Command("BX:0801");
+    errnum = ndiGetError(this->Device);
+  }
   if (errnum)
   {
-    if (errnum == NDI_BAD_CRC || errnum == NDI_TIMEOUT)   // common errors
+    if (this->EnableMeasuredMarkers) { this->RecordMeasuredMarkers(markerBindings); }
+    if (errnum == NDI_BX_CAPTURE_RECOVERY_REPLY)
+    {
+      LOG_INFO("First BX reply quarantined; later request association assumes serialized protocol order.");
+    }
+    else if (errnum == NDI_BAD_CRC || errnum == NDI_TIMEOUT)   // common errors
     {
       LOG_WARNING(ndiErrorString(errnum));
     }
@@ -1581,6 +1745,7 @@ PlusStatus vtkPlusNDITracker::DoBXUpdate()
     if (ndiToolDescriptorIt == this->NdiToolDescriptors.end())
     {
       LOG_ERROR("Tool descriptor is not found for tool " << toolSourceId);
+      if (this->EnableMeasuredMarkers) { toolFlags = TOOL_MISSING; }
       this->ToolTimeStampedUpdate(trackerTool->GetId(), toolToTrackerTransform, toolFlags, toolFrameNumber, toolTimestamp);
       continue;
     }
@@ -1588,14 +1753,33 @@ PlusStatus vtkPlusNDITracker::DoBXUpdate()
     if (portHandle <= 0)
     {
       LOG_ERROR("Port handle is invalid for tool " << toolSourceId);
+      if (this->EnableMeasuredMarkers) { toolFlags = TOOL_MISSING; }
       this->ToolTimeStampedUpdate(toolSourceId.c_str(), toolToTrackerTransform, toolFlags, toolFrameNumber, toolTimestamp);
       continue;
     }
 
     float ndiTransform[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
-    int ndiToolAbsent = ndiGetBXTransform(this->Device, portHandle, ndiTransform);
-    int ndiPortStatus = ndiGetBXPortStatus(this->Device, portHandle);
-    unsigned long ndiFrameIndex = ndiGetBXFrame(this->Device, portHandle);
+    int ndiToolAbsent = 1;
+    int ndiPortStatus = 0;
+    unsigned long ndiFrameIndex = 0;
+    if (this->EnableMeasuredMarkers)
+    {
+      // Opt-in path uses only this reply's snapshot, never invalid legacy caches.
+      for (unsigned i = 0; i < this->MarkerReply->tool_count; ++i)
+      {
+        const auto& tool = this->MarkerReply->tools[i];
+        if (tool.handle != static_cast<unsigned>(portHandle)) { continue; }
+        if (tool.frame_available) { ndiPortStatus = tool.port_status; ndiFrameIndex = tool.frame_number; }
+        if (tool.pose_present) { std::copy(tool.pose, tool.pose + 8, ndiTransform); ndiToolAbsent = 0; }
+        break;
+      }
+    }
+    else
+    {
+      ndiToolAbsent = ndiGetBXTransform(this->Device, portHandle, ndiTransform);
+      ndiPortStatus = ndiGetBXPortStatus(this->Device, portHandle);
+      ndiFrameIndex = ndiGetBXFrame(this->Device, portHandle);
+    }
 
     // convert status flags from NDI to Plus format
     const unsigned long ndiPortStatusValidFlags = NDI_TOOL_IN_PORT | NDI_INITIALIZED | NDI_ENABLED;
@@ -1635,8 +1819,25 @@ PlusStatus vtkPlusNDITracker::DoBXUpdate()
     }
 
     // send the matrix and status to the tool's vtkPlusDataBuffer
-    this->ToolTimeStampedUpdate(toolSourceId.c_str(), toolToTrackerTransform, toolFlags, toolFrameNumber, toolTimestamp);
+    PlusStatus publication = this->ToolTimeStampedUpdate(toolSourceId.c_str(), toolToTrackerTransform, toolFlags, toolFrameNumber, toolTimestamp);
+    if (this->EnableMeasuredMarkers)
+    {
+      for (auto& b : markerBindings)
+      {
+        if (b.TransformName != toolSourceId) { continue; }
+        b.Published = publication == PLUS_SUCCESS;
+        b.PlusStatus = igsioCommon::ConvertToolStatusToString(toolFlags);
+        b.PlusFrame = toolFrameNumber;
+        b.PlusFrameSource = (!ndiToolAbsent && ndiFrameIndex) ? "NDI_BX_device_frame" : "Plus_host_counter_fallback";
+        b.PlusHostTime = toolTimestamp;
+        for (int row = 0; row < 4; ++row)
+          for (int col = 0; col < 4; ++col)
+            b.Matrix[row * 4 + col] = toolToTrackerTransform->GetElement(row, col);
+      }
+    }
   }
+
+  if (this->EnableMeasuredMarkers) { this->RecordMeasuredMarkers(markerBindings); }
 
   // Update tool connections if a wired tool is plugged in
   if (ndiGetBXSystemStatus(this->Device) & NDI_PORT_OCCUPIED)
@@ -1658,7 +1859,11 @@ PlusStatus vtkPlusNDITracker::DoBX2Update()
   errnum = ndiGetError(this->Device);
   if (errnum)
   {
-    if (errnum == NDI_BAD_CRC || errnum == NDI_TIMEOUT)   // common errors
+    if (errnum == NDI_BX_CAPTURE_RECOVERY_REPLY)
+    {
+      LOG_INFO("First BX reply quarantined; later request association assumes serialized protocol order.");
+    }
+    else if (errnum == NDI_BAD_CRC || errnum == NDI_TIMEOUT)   // common errors
     {
       LOG_WARNING(ndiErrorString(errnum));
     }
@@ -1686,6 +1891,7 @@ PlusStatus vtkPlusNDITracker::DoBX2Update()
     if (ndiToolDescriptorIt == this->NdiToolDescriptors.end())
     {
       LOG_ERROR("Tool descriptor is not found for tool " << toolSourceId);
+      if (this->EnableMeasuredMarkers) { toolFlags = TOOL_MISSING; }
       this->ToolTimeStampedUpdate(trackerTool->GetId(), toolToTrackerTransform, toolFlags, toolFrameNumber, toolTimestamp);
       continue;
     }
@@ -1693,6 +1899,7 @@ PlusStatus vtkPlusNDITracker::DoBX2Update()
     if (portHandle <= 0)
     {
       LOG_ERROR("Port handle is invalid for tool " << toolSourceId);
+      if (this->EnableMeasuredMarkers) { toolFlags = TOOL_MISSING; }
       this->ToolTimeStampedUpdate(toolSourceId.c_str(), toolToTrackerTransform, toolFlags, toolFrameNumber, toolTimestamp);
       continue;
     }
@@ -1805,3 +2012,16 @@ PlusStatus vtkPlusNDITracker::ProbeSerialInternal()
   return PLUS_FAIL;
 }
 #endif
+
+
+// Opt-in only; formatting and all file I/O are performed by the recorder worker.
+void vtkPlusNDITracker::RecordMeasuredMarkers(const std::vector<PlusNDIMarkerBinding>& bindings)
+{
+  bool accepted = this->MarkerRecorder && this->MarkerReply &&
+    this->MarkerRecorder->Enqueue(*this->MarkerReply, bindings, this->MarkerConnectionEpoch, this->MarkerPollSequence);
+  if ((!accepted || !this->MarkerRecorder->Healthy()) && !this->MarkerErrorReported)
+  {
+    LOG_ERROR("Measured marker sidecar lost records or failed; inspect its counters/summary. Tool TRANSFORM updates continue.");
+    this->MarkerErrorReported = true;
+  }
+}

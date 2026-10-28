@@ -45,9 +45,14 @@ POSSIBILITY OF SUCH DAMAGES.
 #include "vtkPlusDataCollectionExport.h"
 
 #include "vtkPlusDevice.h"
+#include <stdint.h>
+#include <vector>
 
 class vtkSocketCommunicator;
 struct ndicapi;
+struct ndiBXCapture;
+struct PlusNDIMarkerBinding;
+class PlusNDIMarkerRecorder;
 
 // the maximum size of an NDI reply (excluding new extended binary format)
 #define VTK_NDI_REPLY_LEN 2048
@@ -106,6 +111,8 @@ class vtkPlusDataCollectionExport vtkPlusNDITracker : public vtkPlusDevice
     int             WiredPortNumber;  // >= 0 for wired tools
     unsigned char*  VirtualSROM;      // nonzero for wireless tools
     bool            PortEnabled;      // true if the tool is successfully enabled in the tracker
+    std::string     MarkerBodyFrame, MarkerRomPath, MarkerRomMD5;
+    uint64_t MarkerRomBytes = 0;
     int             PortHandle;       // this number identifies the tool in the tracker
   };
 
@@ -116,6 +123,17 @@ public:
   static vtkPlusNDITracker* New();
   vtkTypeMacro(vtkPlusNDITracker, vtkPlusDevice);
   void PrintSelf(ostream& os, vtkIndent indent);
+  vtkSetMacro(EnableMeasuredMarkers, bool);
+  vtkGetMacro(EnableMeasuredMarkers, bool);
+  vtkSetStdStringMacro(MarkerSidecarDirectory);
+  vtkSetMacro(MarkerQueueCapacity, int);
+  vtkSetMacro(MarkerReplyTimeoutMs, int);
+  PlusStatus StopRecording() override;
+  PlusStatus Disconnect() override;
+  // Independent archive lifecycle, never a measurement-validity flag.
+  std::string GetMeasuredMarkerStorageState() const;
+  std::string GetMeasuredMarkerStorageError() const;
+
 
   /*! Flags for tool LEDs */
   enum LedState
@@ -315,6 +333,8 @@ protected:
 
   /*! Perform a frame parse from a BX request */
   PlusStatus DoBXUpdate();
+  void RecordMeasuredMarkers(const std::vector<PlusNDIMarkerBinding>& bindings);
+
 
   /*! Perform a frame parse from a BX2 request */
   PlusStatus DoBX2Update();
@@ -327,6 +347,13 @@ protected:
   vtkGetMacro(FirmwareMinorRevision, uint32_t);
 
 protected:
+  bool EnableMeasuredMarkers;
+  std::string MarkerSidecarDirectory;
+  int MarkerQueueCapacity, MarkerReplyTimeoutMs;
+  unsigned long long MarkerConnectionEpoch, MarkerPollSequence;
+  bool MarkerErrorReported, MarkerRequestUnsupported, MarkerTransportDesynchronized;
+  PlusNDIMarkerRecorder* MarkerRecorder;
+  ndiBXCapture* MarkerReply;
   unsigned long                      LastFrameNumber; // Index of the last frame number, used for providing a frame number when the tracker doesn't return any transform
   ndicapi*                           Device;
   std::string                        SerialDevice;
