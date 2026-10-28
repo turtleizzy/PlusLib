@@ -131,8 +131,12 @@ int main(int argc, char** argv)
     LOG_DEBUG("Initializing Plus OpenIGTLink server... ");
     if (server->Start(dataCollector.GetPointer(), transformRepository.GetPointer(), serverElement, vtkPlusConfig::GetInstance()->GetDeviceSetConfigurationFileName()) != PLUS_SUCCESS)
     {
-      LOG_ERROR("Failed to start OpenIGTLink server");
-      exit(EXIT_FAILURE);
+      LOG_ERROR("Failed to start OpenIGTLink server; closing acquired devices and archives.");
+      server->Stop();
+      for (auto* startedServer : serverList) { startedServer->Stop(); }
+      dataCollector->Stop();
+      dataCollector->Disconnect();
+      return EXIT_FAILURE;
     }
     serverList.push_back(server);
   }
@@ -172,9 +176,18 @@ int main(int argc, char** argv)
     vtkIGSIOAccurateTimer::DelayWithEventProcessing(commandQueuePollIntervalSec);
   }
 
+  PlusStatus shutdownStatus = PLUS_SUCCESS;
   for (std::vector<vtkPlusOpenIGTLinkServer*>::iterator it = serverList.begin(); it != serverList.end(); ++it)
   {
-    (*it)->Stop();
+    if ((*it)->Stop() != PLUS_SUCCESS) { shutdownStatus = PLUS_FAIL; }
+  }
+  // Finalize while a result can still reach the process caller; destructor-only
+  // cleanup cannot report an incomplete marker archive through the exit code.
+  if (dataCollector->Disconnect() != PLUS_SUCCESS) { shutdownStatus = PLUS_FAIL; }
+  if (shutdownStatus != PLUS_SUCCESS)
+  {
+    LOG_ERROR("Shutdown incomplete: device or sidecar finalization failed.");
+    return EXIT_FAILURE;
   }
 
   LOG_INFO("Shutdown successful.");

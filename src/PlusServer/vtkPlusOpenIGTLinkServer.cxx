@@ -15,6 +15,9 @@ See License.txt for details.
 #include "vtkPlusIgtlMessageCommon.h"
 #include "vtkPlusIgtlMessageFactory.h"
 #include "vtkPlusOpenIGTLinkServer.h"
+#include "PlusReusableServerSocket.h"
+#include <cerrno>
+#include <cstring>
 #include "vtkIGSIORecursiveCriticalSection.h"
 #include "vtkIGSIOTrackedFrameList.h"
 #include "vtkIGSIOTransformRepository.h"
@@ -77,7 +80,7 @@ const float vtkPlusOpenIGTLinkServer::CLIENT_SOCKET_TIMEOUT_SEC = 0.5f;
 
 //----------------------------------------------------------------------------
 vtkPlusOpenIGTLinkServer::vtkPlusOpenIGTLinkServer()
-  : ServerSocket(igtl::ServerSocket::New())
+  : ServerSocket(PlusReusableServerSocket::New().GetPointer())
   , TransformRepository(NULL)
   , DataCollector(NULL)
   , Threader(vtkSmartPointer<vtkMultiThreader>::New())
@@ -213,6 +216,13 @@ PlusStatus vtkPlusOpenIGTLinkServer::StopOpenIGTLinkService()
     LOG_DEBUG("ConnectionReceiverThread stopped");
   }
 
+  // Finish the data sender before destroying its channel or devices.
+  this->DataSenderActive.Request = false;
+  while (this->DataSenderActive.Respond)
+  {
+    vtkIGSIOAccurateTimer::DelayWithEventProcessing(0.02);
+  }
+
   // Disconnect clients (stop receiving thread, close socket)
   std::vector< int > clientIds;
   {
@@ -238,10 +248,12 @@ void* vtkPlusOpenIGTLinkServer::ConnectionReceiverThread(vtkMultiThreader::Threa
 {
   vtkPlusOpenIGTLinkServer* self = (vtkPlusOpenIGTLinkServer*)(data->UserData);
 
-  int r = self->ServerSocket->CreateServer(self->ListeningPort);
+  int r = static_cast<PlusReusableServerSocket*>(self->ServerSocket.GetPointer())->CreateServer(self->ListeningPort);
   if (r < 0)
   {
-    LOG_ERROR("Cannot create a server socket.");
+    const int error = errno;
+    LOG_ERROR("Cannot create a server socket on port " << self->ListeningPort
+              << ": errno=" << error << " (" << std::strerror(error) << ").");
     return NULL;
   }
 
@@ -369,7 +381,8 @@ void* vtkPlusOpenIGTLinkServer::DataSenderThread(vtkMultiThreader::ThreadInfo* d
   }
 
   self->BroadcastChannel = aChannel;
-  if (self->BroadcastChannel)
+  if (self->BroadcastChannel && (self->BroadcastChannel->GetVideoDataAvailable() ||
+      self->BroadcastChannel->GetTrackingDataAvailable() || self->BroadcastChannel->GetFieldDataAvailable()))
   {
     self->BroadcastChannel->GetMostRecentTimestamp(self->LastSentTrackedFrameTimestamp);
   }
