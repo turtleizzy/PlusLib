@@ -1388,6 +1388,11 @@ ItemStatus vtkPlusBuffer::GetInterpolatedStreamBufferItemFromTime(double time, S
   {
     // exact match, no need for interpolation
     bufferItem->DeepCopy(&itemA);
+    // Near-exact samples still represent the requested interpolation time.
+    // Returning the older sample time moves a channel cursor backwards and can
+    // repeatedly broadcast the same frame while waiting for the next sample.
+    bufferItem->SetFilteredTimestamp(time);
+    bufferItem->SetUnfilteredTimestamp(time);
     return ITEM_OK;
   }
 

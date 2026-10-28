@@ -755,6 +755,14 @@ PlusStatus vtkPlusChannel::GetTrackedFrameList(double& aTimestampOfLastFrameAlre
   CUSTOM_RETURN_WITH_FAIL_IF(this->GetMostRecentTimestamp(mostRecentTimestamp) != PLUS_SUCCESS,
                              "Unable to get most recent timestamp!");
 
+  // A cursor at or beyond the current boundary simply has no new data yet.
+  // Do not query a non-existent future UID or turn this normal wait into a busy loop.
+  if (aTimestampOfLastFrameAlreadyGot != UNDEFINED_TIMESTAMP &&
+      aTimestampOfLastFrameAlreadyGot >= mostRecentTimestamp)
+  {
+    return PLUS_SUCCESS;
+  }
+
   PlusStatus status = PLUS_SUCCESS;
   double oldestTimestamp(0);
   if (this->GetOldestTimestamp(oldestTimestamp) != PLUS_SUCCESS)
