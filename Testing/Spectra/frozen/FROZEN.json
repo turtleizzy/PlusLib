@@ -1,0 +1,78 @@
+{
+  "schema": "rmt.ndi.protocol-delivery.v1",
+  "application_protocol": "ndi.raw.v1",
+  "schema_minor": 0,
+  "status": "FROZEN_IMPLEMENTATION_BASELINE_NOT_DEPLOYED",
+  "created_utc": "2026-10-27T06:00:04.387130+00:00",
+  "wire": {
+    "tcp_port_default_proposed": 18945,
+    "opt_in": true,
+    "igtl_type": "STRING",
+    "device_name": "NDI_RAW_V1",
+    "header_version": 1,
+    "header_timestamp": 0,
+    "encoding": 106,
+    "max_utf8_bytes": 65535,
+    "record_types": [
+      "session",
+      "frame",
+      "error",
+      "end"
+    ],
+    "handshake": "CONFIGURED_VERSION_PLUS_FIRST_SESSION_VALIDATION_NO_HELLO_ACK"
+  },
+  "files": {
+    "PROTOCOL.zh.md": {
+      "bytes": 18099,
+      "sha256": "fbb34b8d577fc662e84f22583a8c5ff563466debb1df792c7d7e830e2c38dbbd"
+    },
+    "SCHEMA.json": {
+      "bytes": 47110,
+      "sha256": "dba4bb6720614c554e6e3a7ed5da50ab1d775cd2d16441edcd83eacfa2b438be"
+    },
+    "LOCAL-PLUS-AGENT-PROMPT.zh.md": {
+      "bytes": 4604,
+      "sha256": "4c512a8a19899545b974b974c0eaaca0cdefc86a60b20a50dea03206895e7482"
+    },
+    "GOLDEN.jsonl": {
+      "bytes": 3840,
+      "sha256": "6e4da3708d32dec1486f70183a47c0fb0b15e517d131706cda8f8f34efd94937"
+    },
+    "GOLDEN-VALID-REPEAT.jsonl": {
+      "bytes": 16222,
+      "sha256": "b9298ac92827df7578066e8eab95cb2e7e44017b922d1f9252beb785ed7d9c15"
+    },
+    "GOLDEN.igtl": {
+      "bytes": 4023,
+      "sha256": "a86c137d550e1a0118cc1614b0bd5b75edd52bbdd09eb9a17cdb7d9e555c3b80"
+    },
+    "GOLDEN-VALID-REPEAT.igtl": {
+      "bytes": 16466,
+      "sha256": "bbff273671bb6622749919794938db823660847310efdffbb73e8223272f70a4"
+    },
+    "ERROR-SHAPE.json": {
+      "bytes": 707,
+      "sha256": "802475dad6e7b8761af7271b8b8409422ef2859fcea34f4b25c5ea4686c4439c"
+    },
+    "SYNTHETIC-WIRE.hex": {
+      "bytes": 205,
+      "sha256": "f7e322fff26b91062734cdf32ccc8f42708899e53f18a9f0de525f6929740daa"
+    },
+    "validate_contract.py": {
+      "bytes": 4553,
+      "sha256": "e2eb75f0b63b80fc259d9e263bba45715885084d206d7274e81d21f5a4350403"
+    },
+    "CHECKS.json": {
+      "bytes": 833,
+      "sha256": "91351f74040a6095a10d5fa95458a7ea0639e5535c7172da6cb0c8405fc27caf"
+    }
+  },
+  "scope": "Design/schema/synthetic fixtures only. No production source, calibration, raw recording, driver, hardware or network changed.",
+  "known_limits": [
+    "Actual Plus/RMT implementation and integration not performed",
+    "No serial/hardware/20Hz run or binary binding verification",
+    "Synthetic fixtures do not certify optical accuracy or actual device semantics",
+    "Fit error raw unit requires verified target device profile",
+    "Counter discontinuity deliberately quarantines rather than guesses wrap/reset"
+  ]
+}

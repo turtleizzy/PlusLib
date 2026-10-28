@@ -1,0 +1,14 @@
+/audit/
+/bin/
+/lib/
+/src/
+/build-pluslib/
+/build-ndicapi/
+/initial-cache.cmake
+/roms/
+/recordings/
+/data/
+/config/generated/
+/fixtures/raw-v1/
+__pycache__/
+*.pyc

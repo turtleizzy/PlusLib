@@ -1,0 +1,379 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ndi:marker:capture:v1",
+  "title": "NDI measured-marker capture v1",
+  "description": "JSON structure only; raw CRC, identity and counter conservation require consumer validation. Independent marker exposure time/frame unavailable.",
+  "type": "object",
+  "required": [
+    "schema",
+    "record_type",
+    "session_id"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ndi.marker.capture.v1"
+    },
+    "record_type": {
+      "enum": [
+        "session_start",
+        "measurement_reply",
+        "session_end",
+        "summary"
+      ]
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "record_type": {
+            "const": "measurement_reply"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "connection_epoch",
+          "host_poll_sequence",
+          "reply_flags",
+          "reply_valid",
+          "raw_measurement_timestamp",
+          "raw_reply_hex",
+          "command_wire_bytes",
+          "reply_wire_bytes",
+          "units",
+          "header_crc_verified",
+          "payload_crc_verified",
+          "tools",
+          "host_command_start_monotonic_ns",
+          "host_receive_monotonic_ns",
+          "host_receive_wall_unix_ns",
+          "host_decode_done_monotonic_ns",
+          "round_trip_ns"
+        ],
+        "properties": {
+          "connection_epoch": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "host_poll_sequence": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "reply_flags": {
+            "const": 2059
+          },
+          "reply_valid": {
+            "type": "boolean"
+          },
+          "raw_measurement_timestamp": {
+            "type": "null"
+          },
+          "raw_reply_hex": {
+            "type": "string",
+            "pattern": "^([a-f0-9]{2})*$"
+          },
+          "command_wire_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "reply_wire_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65543
+          },
+          "units": {
+            "const": "mm"
+          },
+          "header_crc_verified": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "payload_crc_verified": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/tool"
+            }
+          },
+          "host_command_start_monotonic_ns": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+$"
+          },
+          "host_receive_monotonic_ns": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+$"
+          },
+          "host_receive_wall_unix_ns": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+$"
+          },
+          "host_decode_done_monotonic_ns": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+$"
+          },
+          "round_trip_ns": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]+$"
+          },
+          "request_association_verified": {
+            "const": false
+          },
+          "request_sent": {
+            "type": "boolean"
+          },
+          "reply_decoded": {
+            "type": "boolean"
+          },
+          "command_write_count_known": {
+            "type": "boolean"
+          },
+          "transport_state": {
+            "enum": [
+              "decoder_only_no_transport",
+              "serialized_order_assumed",
+              "first_reply_quarantined",
+              "reconnect_required"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "record_type": {
+            "const": "summary"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "storage_complete",
+          "counters",
+          "error"
+        ],
+        "properties": {
+          "storage_complete": {
+            "type": "boolean"
+          },
+          "counters": {
+            "type": "object"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "counter_conservation": {
+            "type": "boolean"
+          },
+          "producer_boundary": {
+            "type": "string"
+          },
+          "lifecycle": {
+            "enum": [
+              "startup_failed",
+              "finalized_complete",
+              "finalized_incomplete"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "marker": {
+      "type": "object",
+      "required": [
+        "label",
+        "label_index_zero_based",
+        "device_status",
+        "xyz_mm",
+        "sample_valid",
+        "out_of_volume",
+        "state"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "pattern": "^[A-T]$"
+        },
+        "label_index_zero_based": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 19
+        },
+        "device_status": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15
+        },
+        "xyz_mm": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            }
+          ]
+        },
+        "sample_valid": {
+          "type": "boolean"
+        },
+        "detected": {
+          "type": "boolean"
+        },
+        "used_for_tool_pose": {
+          "type": "boolean"
+        },
+        "out_of_volume": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "state": {
+          "type": "string"
+        }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "required": [
+        "handle",
+        "transform_name",
+        "rom",
+        "device_frame_number",
+        "binding_epoch",
+        "counter_epoch",
+        "frame_classification",
+        "is_new_device_frame",
+        "pose",
+        "markers",
+        "unidentified_measured_positions",
+        "marker_device_frame_number",
+        "marker_device_timestamp",
+        "plus_buffer_publication"
+      ],
+      "properties": {
+        "handle": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "transform_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rom": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "device_frame_number": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "marker_device_frame_number": {
+          "type": "null"
+        },
+        "marker_device_timestamp": {
+          "type": "null"
+        },
+        "binding_epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "counter_epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "frame_classification": {
+          "enum": [
+            "first_frame",
+            "new_frame",
+            "counter_wrap",
+            "repeated_frame",
+            "counter_reset_or_out_of_order",
+            "unavailable"
+          ]
+        },
+        "is_new_device_frame": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "pose": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "markers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/marker"
+          },
+          "maxItems": 20
+        },
+        "unidentified_measured_positions": {
+          "type": "array",
+          "maxItems": 20
+        },
+        "plus_buffer_publication": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

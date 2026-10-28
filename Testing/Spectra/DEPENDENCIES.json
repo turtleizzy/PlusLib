@@ -1,0 +1,86 @@
+{
+  "schema": "plus.spectra.dependencies.v1",
+  "ndicapi": {
+    "upstream_url": "https://github.com/PlusToolkit/ndicapi.git",
+    "base_commit": "d75730b7a9d9c243ed0bcaf49ef833a00e374024",
+    "reviewed_head": "5766b4f2450f198ffcdfb09700cdae5d264d875c",
+    "result_tree": "3e45a8c984a3922ee8440f364ea793cde36ab36b",
+    "patches": [
+      {
+        "path": "ndicapi-patches/0001-Fix-fragmented-Spectra-probing-and-preserve-paced-se.patch",
+        "sha256": "8d5b4e83d4fcd867765b5db1de144f8ebd26ffae9e5ed36ea7812e2c7aa873db"
+      },
+      {
+        "path": "ndicapi-patches/0002-Capture-bounded-BX-observations-with-explicit-desync.patch",
+        "sha256": "2c8c7c5e3772ad1b0faf1f981ddf92666b59e60a830a0cb291d12d2ada368170"
+      },
+      {
+        "path": "ndicapi-patches/0003-Preserve-raw-BX-values-and-verify-reset-evidence-for.patch",
+        "sha256": "71c074f9de2b842e3ea9e01f521d82d97636907d146a0320b8c9f84d87ab7195"
+      },
+      {
+        "path": "ndicapi-patches/0004-Add-portable-synthetic-and-PTY-serial-recovery-regre.patch",
+        "sha256": "812753ad9418a61176456861e179c7bdfa4753a1dd5fbf59b7bde3131187e21e"
+      }
+    ]
+  },
+  "wire": {
+    "schema": "ndi.raw.v1",
+    "schema_minor": 0,
+    "frozen_manifest_sha256": "e7e4e62caf2b7a87969a1ca2abea34703c6d3a9ad9a3f6ebb649c5a0c2e0dcd6"
+  },
+  "not_in_repository": [
+    "private ROMs",
+    "live marker coordinates or captures",
+    "receiver archives",
+    "build outputs",
+    "local authentication/configuration"
+  ],
+  "existing_dependency_source_pins": [
+    {
+      "name": "PlusBuild",
+      "url": "https://github.com/PlusToolkit/PlusBuild.git",
+      "commit": "4fdc469239003d5a72ab24212bd69e443f788ac0"
+    },
+    {
+      "name": "vtk",
+      "url": "https://github.com/kitware/vtk.git",
+      "commit": "285daeedd58eb890cb90d6e907d822eea3d2d092"
+    },
+    {
+      "name": "itk",
+      "url": "https://github.com/InsightSoftwareConsortium/ITK",
+      "commit": "f98d5fac5e1d5ef694f3010f12bbbc2c792994c6"
+    },
+    {
+      "name": "IGSIO",
+      "url": "https://github.com/IGSIO/IGSIO.git",
+      "commit": "e5d0df6bcd737ff955ea7b465e7c64e3be25fd5f"
+    },
+    {
+      "name": "OpenIGTLink",
+      "url": "https://github.com/openigtlink/OpenIGTLink.git",
+      "commit": "94244fed7051e00cbcd4c341a7d7656be8ac404a"
+    },
+    {
+      "name": "OpenIGTLinkIO",
+      "url": "https://github.com/IGSIO/OpenIGTLinkIO.git",
+      "commit": "d7f6aef826d934577a39b48d9485bc0848f27cb8"
+    },
+    {
+      "name": "vtkAddon",
+      "url": "https://github.com/Slicer/vtkAddon.git",
+      "commit": "c6570d2a03340cc4a9e140ab664e3d018c12b456"
+    },
+    {
+      "name": "PlusDoc",
+      "url": "https://github.com/PlusToolkit/PlusDoc.git",
+      "commit": "10c9be9cbd297bcec9e006fd0654f48f9fbe546b"
+    }
+  ],
+  "existing_vtk_compatibility_patch": {
+    "path": "dependency-patches/vtk-sepreader-standard-include.patch",
+    "sha256": "791293471ab18a9de62bdfee66f07e4bcd0849dd86a9ec5fdb0eddb2b9cc19d2",
+    "scope": "Existing local VTK include repair, outside PlusLib/ndicapi; optional reconstruction evidence, not a new VTK fork or cold dependency validation"
+  }
+}

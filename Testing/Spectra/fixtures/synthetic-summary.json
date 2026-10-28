@@ -1,0 +1,21 @@
+{
+  "schema": "ndi.marker.capture.v1",
+  "record_type": "summary",
+  "session_id": "SYNTHETIC-DEMONSTRATION-v1",
+  "storage_complete": true,
+  "counters": {
+    "attempted": 8,
+    "enqueued": 8,
+    "written": 8,
+    "dropped_queue_full": 0,
+    "dropped_queue_busy": 0,
+    "dropped_allocation": 0,
+    "rejected_not_accepting": 0,
+    "discarded_after_write_failure": 0,
+    "error_replies": 1,
+    "repeat_tool_frames": 2,
+    "counter_wraps": 1,
+    "counter_reset_or_out_of_order": 0
+  },
+  "error": null
+}

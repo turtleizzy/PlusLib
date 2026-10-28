@@ -1,0 +1,12 @@
+diff --git a/IO/Image/vtkSEPReader.h b/IO/Image/vtkSEPReader.h
+index 94600a8a07..d42c5dfd38 100644
+--- a/IO/Image/vtkSEPReader.h
++++ b/IO/Image/vtkSEPReader.h
+@@ -25,6 +25,7 @@
+ #include "vtkImageAlgorithm.h"
+ #include "vtkNew.h" // for ivars
+ 
++#include <cstdint>
+ #include <array>  // for std::array
+ #include <string> // for std::string
+ 

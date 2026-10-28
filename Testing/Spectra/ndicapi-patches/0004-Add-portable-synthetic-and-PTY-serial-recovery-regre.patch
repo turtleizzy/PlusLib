@@ -1,0 +1,804 @@
+From 5766b4f2450f198ffcdfb09700cdae5d264d875c Mon Sep 17 00:00:00 2001
+From: agnimon <agnimon.codex1@gmail.com>
+Date: Wed, 28 Oct 2026 17:49:31 +0800
+Subject: [PATCH 4/4] Add portable synthetic and PTY serial recovery
+ regressions
+
+Build this checkout in an ignored test workspace and exercise decoder, paced/default serial compatibility, late replies, deadlines and full reset evidence. The 67 method executions passed on Linux using owned PTYs only; no tracker was opened by this runner.
+---
+ Testing/Spectra/.gitignore                    |   5 +
+ Testing/Spectra/README.md                     |   7 +
+ Testing/Spectra/VALIDATION.json               |  13 ++
+ Testing/Spectra/run.py                        |  15 ++
+ Testing/Spectra/tests/bx_fixtures.py          |  38 ++++
+ Testing/Spectra/tests/fault_shim.cxx          |  72 ++++++
+ Testing/Spectra/tests/test_bx_capture.py      | 214 ++++++++++++++++++
+ Testing/Spectra/tests/test_reset_recovery.py  |  34 +++
+ Testing/Spectra/tests/test_serial_compat.py   | 170 ++++++++++++++
+ .../Spectra/tests/test_transport_deadlines.py | 146 ++++++++++++
+ 10 files changed, 714 insertions(+)
+ create mode 100644 Testing/Spectra/.gitignore
+ create mode 100644 Testing/Spectra/README.md
+ create mode 100644 Testing/Spectra/VALIDATION.json
+ create mode 100644 Testing/Spectra/run.py
+ create mode 100644 Testing/Spectra/tests/bx_fixtures.py
+ create mode 100644 Testing/Spectra/tests/fault_shim.cxx
+ create mode 100644 Testing/Spectra/tests/test_bx_capture.py
+ create mode 100644 Testing/Spectra/tests/test_reset_recovery.py
+ create mode 100644 Testing/Spectra/tests/test_serial_compat.py
+ create mode 100644 Testing/Spectra/tests/test_transport_deadlines.py
+
+diff --git a/Testing/Spectra/.gitignore b/Testing/Spectra/.gitignore
+new file mode 100644
+index 0000000..b3422e9
+--- /dev/null
++++ b/Testing/Spectra/.gitignore
+@@ -0,0 +1,5 @@
++/audit/
++/bin/
++/build/
++__pycache__/
++*.pyc
+diff --git a/Testing/Spectra/README.md b/Testing/Spectra/README.md
+new file mode 100644
+index 0000000..762d9c5
+--- /dev/null
++++ b/Testing/Spectra/README.md
+@@ -0,0 +1,7 @@
++# Linux Spectra transport regressions
++
++These tests use synthetic BX bytes and owned PTYs only. They never open a physical tracker. They cover fragmented probing, binary/ASCII CRC, partial/late replies, paced writes and shared deadlines, sticky desynchronization, exact reset evidence and generic serial compatibility.
++
++Run `python3 -B Testing/Spectra/run.py` from this repository. Requires Linux, CMake, a C++17 compiler and Python 3. The runner builds only this ndicapi checkout, compiles a test-only fault shim, and reports results in ignored `Testing/Spectra/audit`. Default and 1500 microsecond serial compatibility are checked independently. Do not preload the fault shim into a real device process.
++
++Full reset token acceptance alone leaves capture desynchronized; the sole command owner must still verify INIT, COMM, configuration, tool enable and TSTART before enabling the recovered acquisition. A CRC-correct BX, flush or counter increment is not recovery evidence. PTY/software success does not establish physical tracking accuracy.
+diff --git a/Testing/Spectra/VALIDATION.json b/Testing/Spectra/VALIDATION.json
+new file mode 100644
+index 0000000..8a2f177
+--- /dev/null
++++ b/Testing/Spectra/VALIDATION.json
+@@ -0,0 +1,13 @@
++{
++  "classification": "SYNTHETIC_AND_OWNED_PTY_ONLY",
++  "test_methods": 67,
++  "groups": {
++    "test_transport_deadlines.py.log": 7,
++    "test_serial_compat.py.log": 10,
++    "test_reset_recovery.py.log": 5,
++    "test_serial_paced.log": 10,
++    "test_bx_capture.py.log": 35
++  },
++  "physical_device_opened": false,
++  "hardware_accuracy_claim": false
++}
+diff --git a/Testing/Spectra/run.py b/Testing/Spectra/run.py
+new file mode 100644
+index 0000000..d47bd86
+--- /dev/null
++++ b/Testing/Spectra/run.py
+@@ -0,0 +1,15 @@
++"""Build and test only this ndicapi checkout using synthetic bytes and owned PTYs."""
++from pathlib import Path
++import os,subprocess,sys
++T=Path(__file__).resolve().parent;ROOT=T.parents[1]
++for n in ['audit','bin']:(T/n).mkdir(exist_ok=True)
++def run(args,name,env=None):
++ with (T/'audit'/name).open('w') as out:r=subprocess.run(args,env=env,cwd=T,stdout=out,stderr=subprocess.STDOUT)
++ if r.returncode:raise SystemExit('FAIL '+str(T/'audit'/name))
++ print('PASS',name,flush=True)
++run(['cmake','-S',str(ROOT),'-B',str(T/'build'),'-DCMAKE_BUILD_TYPE=Release','-DCMAKE_LIBRARY_OUTPUT_DIRECTORY='+str(T/'bin')],'configure.log')
++run(['cmake','--build',str(T/'build'),'-j','4'],'build.log')
++run(['c++','-std=c++17','-shared','-fPIC',str(T/'tests/fault_shim.cxx'),'-ldl','-pthread','-o',str(T/'bin/fault_shim.so')],'build-shim.log')
++env=dict(os.environ,NDICAPI_LIBRARY=str(T/'bin/libndicapi.so'),PYTHONDONTWRITEBYTECODE='1');env.pop('LD_PRELOAD',None);env.pop('NDICAPI_SERIAL_WRITE_DELAY_US',None)
++for name in ['test_bx_capture.py','test_serial_compat.py','test_transport_deadlines.py','test_reset_recovery.py']:run([sys.executable,'-B',str(T/'tests'/name)],name+'.log',env)
++run([sys.executable,'-B',str(T/'tests/test_serial_compat.py')],'test_serial_paced.log',dict(env,NDICAPI_SERIAL_WRITE_DELAY_US='1500'))
+diff --git a/Testing/Spectra/tests/bx_fixtures.py b/Testing/Spectra/tests/bx_fixtures.py
+new file mode 100644
+index 0000000..dfa3342
+--- /dev/null
++++ b/Testing/Spectra/tests/bx_fixtures.py
+@@ -0,0 +1,38 @@
++"""Independent synthetic protocol builder. These bytes are NOT device recordings."""
++import struct
++def crc16(data):
++    c=0
++    for b in data:
++        c^=b
++        for _ in range(8):c=(c>>1)^0xa001 if c&1 else c>>1
++    return c
++def error_reply(code=1):
++    text=('ERROR%02X'%code).encode()
++    return text+('%04X'%crc16(text)).encode()+b'\r'
++def tool(handle=1,frame=123,status=1,markers=None,pose=None,port=0x31,tool_info=0,points=None):
++    return dict(handle=handle,frame=frame,status=status,markers=markers or {},
++                pose=pose or [1,0,0,0,100,200,300,0.1],port=port,tool_info=tool_info,points=points)
++def packet(tools,flags=0x080b,system=0,extra=b''):
++    data=bytearray([len(tools)])
++    for t in tools:
++        data+=bytes([t['handle'],t['status']])
++        if t['status']==4:continue
++        if t['status']!=2:data+=struct.pack('<8f',*t['pose'])
++        data+=struct.pack('<II',t['port'],t['frame'])
++        labels=[0]*20
++        for label,(status,xyz,oov) in t['markers'].items():labels[label]=status
++        if flags&2:
++            packed=[labels[i*2]|(labels[i*2+1]<<4) for i in range(10)]
++            data+=bytes([t['tool_info']]+list(reversed(packed)))
++        if flags&8:
++            points=t['points']
++            if points is None:points=[(xyz,oov) for label,(status,xyz,oov) in sorted(t['markers'].items()) if status]
++            data.append(len(points))
++            bits=bytearray((len(points)+7)//8)
++            for i,(xyz,oov) in enumerate(points):
++                if oov:bits[i//8]|=1<<(i%8)
++            data+=bits
++            for xyz,oov in points:data+=struct.pack('<3f',*xyz)
++    data+=struct.pack('<H',system)+extra
++    head=b'\xc4\xa5'+struct.pack('<H',len(data))
++    return head+struct.pack('<H',crc16(head))+data+struct.pack('<H',crc16(data))
+diff --git a/Testing/Spectra/tests/fault_shim.cxx b/Testing/Spectra/tests/fault_shim.cxx
+new file mode 100644
+index 0000000..e930cad
+--- /dev/null
++++ b/Testing/Spectra/tests/fault_shim.cxx
+@@ -0,0 +1,72 @@
++// OFFLINE ONLY: deterministic faults for test PTYs / private ndi-marker files.
++// Never preload into a real-device capture process.
++#include <atomic>
++#include <cerrno>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <dlfcn.h>
++#include <poll.h>
++#include <pthread.h>
++#include <unistd.h>
++
++namespace {
++std::atomic<bool> injected{false};
++std::atomic<unsigned> dataWrites{0}, serialReads{0};
++bool mode(const char* key,const char* expected){const char* p=getenv(key);return p&&!strcmp(p,expected);}
++bool path(int fd,char* p){ssize_t n=readlink((std::string("/proc/self/fd/")+std::to_string(fd)).c_str(),p,1023);if(n<0)return false;p[n]=0;return true;}
++bool serial(int fd){char p[1024];const char* wanted=getenv("NDI_TEST_SERIAL_PATH");return wanted&&strstr(wanted,"/dev/pts/")==wanted&&path(fd,p)&&!strcmp(p,wanted);}
++bool sink(int fd,const char* suffix){char p[1024];return path(fd,p)&&strstr(p,"/ndi-marker-")&&strstr(p,suffix);}
++bool once(const char* value){return mode("NDI_TEST_STORAGE_FAULT",value)&&!injected.exchange(true);}
++}
++extern "C" {
++ssize_t read(int fd,void* data,size_t n){
++  static auto real=reinterpret_cast<ssize_t(*)(int,void*,size_t)>(dlsym(RTLD_NEXT,"read"));
++  if(serial(fd)){
++    unsigned count=++serialReads;
++    if(mode("NDI_TEST_SERIAL_FAULT","read_eagain")||(count>1&&mode("NDI_TEST_SERIAL_FAULT","reset_eagain"))){errno=EAGAIN;return -1;}
++    if(mode("NDI_TEST_SERIAL_FAULT","read_eintr")||(count>1&&mode("NDI_TEST_SERIAL_FAULT","reset_eintr"))){errno=EINTR;return -1;}
++  }
++  return real(fd,data,n);
++}
++ssize_t write(int fd,const void* data,size_t n){
++  static auto real=reinterpret_cast<ssize_t(*)(int,const void*,size_t)>(dlsym(RTLD_NEXT,"write"));
++  if(serial(fd)){
++    if(mode("NDI_TEST_SERIAL_FAULT","write_eagain")){errno=EAGAIN;return -1;}
++    if(mode("NDI_TEST_SERIAL_FAULT","write_eintr")){errno=EINTR;return -1;}
++    if(mode("NDI_TEST_SERIAL_FAULT","zero_write"))return 0;
++    if(mode("NDI_TEST_SERIAL_FAULT","short_write")&&n>3)n=3;
++  }
++  if(sink(fd,"/measurements.jsonl")){
++    unsigned count=++dataWrites;
++    if((count==1&&once("header_write"))||(count>1&&once("measurement_write"))){errno=EIO;return -1;}
++  }
++  if(sink(fd,"/summary.pending.json")&&once("summary_write")){errno=EIO;return -1;}
++  return real(fd,data,n);
++}
++int poll(pollfd* fds,nfds_t n,int timeout){
++  static auto real=reinterpret_cast<int(*)(pollfd*,nfds_t,int)>(dlsym(RTLD_NEXT,"poll"));
++  if(mode("NDI_TEST_SERIAL_FAULT","poll_eintr"))for(nfds_t i=0;i<n;++i)if(serial(fds[i].fd)){errno=EINTR;return -1;}
++  return real(fds,n,timeout);
++}
++int fsync(int fd){
++  static auto real=reinterpret_cast<int(*)(int)>(dlsym(RTLD_NEXT,"fsync"));
++  if((sink(fd,"/measurements.jsonl")&&once("data_fsync"))||(sink(fd,"/summary.pending.json")&&once("summary_fsync"))){errno=EIO;return -1;}
++  return real(fd);
++}
++int close(int fd){
++  static auto real=reinterpret_cast<int(*)(int)>(dlsym(RTLD_NEXT,"close"));
++  bool fail=(sink(fd,"/measurements.jsonl")&&once("data_close"))||(sink(fd,"/summary.pending.json")&&once("summary_close"));
++  int result=real(fd);if(fail){errno=EIO;return -1;}return result;
++}
++int link(const char* from,const char* to){
++  static auto real=reinterpret_cast<int(*)(const char*,const char*)>(dlsym(RTLD_NEXT,"link"));
++  if(strstr(from,"/ndi-marker-")&&once("summary_link")){errno=EPERM;return -1;}
++  return real(from,to);
++}
++int pthread_create(pthread_t* thread,const pthread_attr_t* attr,void*(*fn)(void*),void* value){
++  static auto real=reinterpret_cast<int(*)(pthread_t*,const pthread_attr_t*,void*(*)(void*),void*)>(dlsym(RTLD_NEXT,"pthread_create"));
++  if(getenv("NDI_TEST_ARMED")&&once("thread_create"))return EAGAIN;
++  return real(thread,attr,fn,value);
++}
++}
+diff --git a/Testing/Spectra/tests/test_bx_capture.py b/Testing/Spectra/tests/test_bx_capture.py
+new file mode 100644
+index 0000000..afcff7a
+--- /dev/null
++++ b/Testing/Spectra/tests/test_bx_capture.py
+@@ -0,0 +1,214 @@
++"""Pure decoder + isolated PTY transport tests; never opens a physical device."""
++import ctypes as C
++import os
++from pathlib import Path
++import pty
++import select
++import struct
++import threading
++import time
++import unittest
++from bx_fixtures import packet,tool,error_reply,crc16
++
++ROOT=Path(__file__).resolve().parents[1]
++LIB=C.CDLL(os.environ.get('NDICAPI_LIBRARY',str(ROOT/'bin/libndicapi.so')))
++class Marker(C.Structure):
++    _fields_=[('label_index',C.c_int),('status',C.c_int),('out_of_volume',C.c_int),('finite',C.c_int),('xyz',C.c_float*3)]
++class Tool(C.Structure):
++    _fields_=[('handle',C.c_uint),('handle_status',C.c_uint),('port_status',C.c_uint),('frame_number',C.c_uint),
++        ('frame_available',C.c_int),('pose_present',C.c_int),('additional_info_available',C.c_int),
++        ('pose',C.c_float*8),('tool_information',C.c_uint),('marker_status',C.c_ubyte*20),
++        ('marker_count',C.c_uint),('marker_identity_known',C.c_int),('markers',Marker*20),
++        ('wire_offset',C.c_uint),('wire_length',C.c_uint)]
++class Capture(C.Structure):
++    _fields_=[('valid',C.c_int),('error_code',C.c_int),('device_error_code',C.c_int),
++        ('header_crc_valid',C.c_int),('body_crc_valid',C.c_int),('error_message',C.c_char*160),
++        ('reply_flags',C.c_uint),('tool_count',C.c_uint),('system_status',C.c_uint),('raw_length',C.c_uint),('command_wire_bytes',C.c_uint),
++        ('command_start_monotonic_ns',C.c_uint64),('receive_monotonic_ns',C.c_uint64),('receive_wall_ns',C.c_uint64),('decode_done_monotonic_ns',C.c_uint64),
++        ('tools',Tool*24),('raw',C.c_ubyte*65543),('transport_state',C.c_int),('request_sent',C.c_int),('reply_decoded',C.c_int),('command_write_count_known',C.c_int),('request_association_verified',C.c_int)]
++LIB.ndiDecodeBXCapture.argtypes=[C.c_void_p,C.c_uint,C.c_uint,C.POINTER(Capture)]
++LIB.ndiOpenSerial.argtypes=[C.c_char_p];LIB.ndiOpenSerial.restype=C.c_void_p
++LIB.ndiCloseSerial.argtypes=[C.c_void_p]
++LIB.ndiCaptureBX.argtypes=[C.c_void_p,C.c_uint,C.c_uint,C.POINTER(Capture)]
++LIB.ndiGetBXTransform.argtypes=[C.c_void_p,C.c_int,C.POINTER(C.c_float)]
++LIB.ndiGetBXPortStatus.argtypes=[C.c_void_p,C.c_int]
++LIB.ndiGetBXFrame.argtypes=[C.c_void_p,C.c_int];LIB.ndiGetBXFrame.restype=C.c_ulong
++def decode(data,flags=0x080b,result=None):
++    result=result or Capture()
++    code=LIB.ndiDecodeBXCapture(data,len(data),flags,C.byref(result))
++    return code,result
++
++class DecodeTests(unittest.TestCase):
++    def test_single_measured_point_not_pose_derived(self):
++        raw=packet([tool(markers={0:(3,[1.25,2.5,-4.75],0)})])
++        code,r=decode(raw)
++        self.assertEqual(code,0);self.assertEqual(list(r.tools[0].markers[0].xyz),[1.25,2.5,-4.75])
++        self.assertEqual(list(r.tools[0].pose)[4:7],[100,200,300])
++        self.assertEqual(bytes(r.raw[:r.raw_length]),raw)
++    def test_sparse_marker_labels_A_M_T_and_nibbles(self):
++        code,r=decode(packet([tool(markers={0:(3,[1,2,3],0),12:(1,[4,5,6],0),19:(2,[7,8,9],0)})]))
++        self.assertEqual(code,0)
++        self.assertEqual([(r.tools[0].markers[i].label_index,r.tools[0].markers[i].status) for i in range(3)],[(0,3),(12,1),(19,2)])
++    def test_multi_tool_per_tool_frame_numbers(self):
++        code,r=decode(packet([tool(1,30),tool(2,31)]))
++        self.assertEqual((code,r.tool_count),(0,2));self.assertEqual([r.tools[i].frame_number for i in range(2)],[30,31])
++    def test_missing_pose_partial_visible_markers(self):
++        code,r=decode(packet([tool(status=2,markers={2:(3,[9,8,7],0)})]))
++        self.assertEqual(code,0);self.assertEqual(r.tools[0].pose_present,0);self.assertEqual(r.tools[0].marker_count,1)
++    def test_whole_tool_missing_has_no_coordinates(self):
++        code,r=decode(packet([tool(status=2)]))
++        self.assertEqual((code,r.tools[0].marker_count,r.tools[0].pose_present),(0,0,0))
++    def test_disabled_tool_has_unavailable_frame(self):
++        code,r=decode(packet([tool(status=4),tool(2,70)]))
++        self.assertEqual(code,0);self.assertEqual(r.tools[0].frame_available,0);self.assertEqual(r.tools[1].frame_number,70)
++    def test_out_of_volume_retains_measured_values(self):
++        code,r=decode(packet([tool(markers={3:(4,[1,2,3],1)},port=0x71)]))
++        self.assertEqual(code,0);self.assertEqual(r.tools[0].markers[0].out_of_volume,1)
++    def test_identity_mismatch_is_explicit_unknown(self):
++        code,r=decode(packet([tool(markers={0:(3,[1,2,3],0),1:(3,[4,5,6],0)},points=[([1,2,3],0)])]))
++        self.assertEqual(code,0);self.assertFalse(r.tools[0].marker_identity_known);self.assertEqual(r.tools[0].markers[0].label_index,-1)
++    def test_frame_zero_is_available(self):
++        code,r=decode(packet([tool(frame=0)]));self.assertEqual((code,r.tools[0].frame_number,r.tools[0].frame_available),(0,0,1))
++    def test_reply_over_2047_bytes(self):
++        raw=packet([tool(i+1,9,markers={j:(3,[i,j,1000+j],0) for j in range(20)}) for i in range(24)])
++        self.assertGreater(len(raw),2047)
++        code,r=decode(raw);self.assertEqual((code,r.tool_count,r.tools[23].marker_count),(0,24,20))
++    def test_bad_header_crc(self):
++        raw=bytearray(packet([tool()]));raw[4]^=1
++        code,r=decode(bytes(raw));self.assertEqual(code,0x100);self.assertFalse(r.valid)
++    def test_bad_body_crc(self):
++        raw=bytearray(packet([tool()]));raw[20]^=1
++        code,r=decode(bytes(raw));self.assertEqual((code,r.tool_count),(0x100,0))
++    def test_truncated_response(self):
++        code,r=decode(packet([tool()])[:-1]);self.assertEqual(code,0x201);self.assertFalse(r.valid)
++    def test_truncated_block_with_valid_crc(self):
++        raw=packet([tool()]);body=raw[6:-2][:-5];head=b'\xc4\xa5'+struct.pack('<H',len(body))
++        code,r=decode(head+struct.pack('<H',crc16(head))+body+struct.pack('<H',crc16(body)))
++        self.assertEqual(code,0x201)
++    def test_duplicate_handles_rejected(self):
++        self.assertEqual(decode(packet([tool(1),tool(1)]))[0],0x201)
++    def test_oversized_handle_count_rejected(self):
++        self.assertEqual(decode(packet([tool(i+1,status=4) for i in range(25)]))[0],0x201)
++    def test_excess_markers_rejected(self):
++        self.assertEqual(decode(packet([tool(points=[([1,2,3],0)]*21)]))[0],0x201)
++    def test_extra_trailing_data_rejected(self):
++        self.assertEqual(decode(packet([tool()],extra=b'junk'))[0],0x201)
++    def test_nonfinite_marker_not_valid(self):
++        code,r=decode(packet([tool(markers={0:(3,[float('nan'),2,3],0)})]))
++        self.assertEqual(code,0);self.assertFalse(r.tools[0].markers[0].finite)
++    def test_nonfinite_pose_fails_explicitly(self):
++        self.assertEqual(decode(packet([tool(pose=[1,0,0,0,float('nan'),0,0,0])]))[0],0x201)
++    def test_device_unsupported_response(self):
++        code,r=decode(error_reply(1));self.assertEqual((code,r.device_error_code),(1,1))
++    def test_malformed_device_error_with_valid_crc_rejected(self):
++        for body in (b'ERROR0Z',b'ERROR01X'):
++            raw=body+('%04X'%crc16(body)).encode()+b'\r'
++            code,r=decode(raw);self.assertEqual(code,0x201);self.assertFalse(r.valid)
++    def test_stray_not_implemented(self):
++        self.assertEqual(decode(packet([tool()]),0x180b)[0],0x201)
++    def test_legacy_flags_decode_pose_unchanged(self):
++        code,r=decode(packet([tool()],0x0801),0x0801)
++        self.assertEqual(code,0);self.assertEqual(list(r.tools[0].pose)[4:7],[100,200,300])
++    def test_result_is_cleared_after_failure(self):
++        r=Capture();decode(packet([tool(markers={0:(3,[1,2,3],0)})]),result=r)
++        code,r=decode(b'bad',result=r);self.assertFalse(r.valid);self.assertEqual(r.tool_count,0)
++
++class TransportTests(unittest.TestCase):
++    def setUp(self):
++        self.master,self.slave=pty.openpty();self.path=os.ttyname(self.slave)
++        assert self.path.startswith('/dev/pts/')
++        self.device=LIB.ndiOpenSerial(self.path.encode());self.assertTrue(self.device)
++        self.threads=[];self.exceptions=[];self.commands=[]
++        self.send_reply(packet([tool(frame=1)]))
++        code,first=self.capture()
++        self.assertEqual(code,0x205);self.assertEqual(first.transport_state,2)
++        self.assertFalse(first.valid);self.commands.clear();self.threads.clear()
++    def tearDown(self):
++        for t in self.threads:t.join(timeout=3)
++        LIB.ndiCloseSerial(self.device);os.close(self.master);os.close(self.slave)
++        self.assertFalse(self.exceptions,str(self.exceptions))
++    def send_reply(self,data,chunk=0,delay=0):
++        def device():
++            try:
++                command=b'';deadline=time.monotonic()+2
++                while not command.endswith(b'\r'):
++                    if time.monotonic()>deadline:raise TimeoutError(command)
++                    if select.select([self.master],[],[],0.05)[0]:command+=os.read(self.master,256)
++                self.commands.append(command)
++                if data is not None:
++                    size=chunk or max(len(data),1)
++                    for i in range(0,len(data),size):
++                        os.write(self.master,data[i:i+size])
++                        if delay:time.sleep(delay)
++            except Exception as e:self.exceptions.append(e)
++        t=threading.Thread(target=device);t.start();self.threads.append(t)
++    def capture(self,timeout=1000,flags=0x080b):
++        r=Capture();code=LIB.ndiCaptureBX(self.device,flags,timeout,C.byref(r))
++        for t in self.threads:t.join(timeout=2)
++        return code,r
++    def test_fragmented_every_byte_and_timing(self):
++        data=packet([tool(markers={0:(3,[1,2,3],0)})]);self.send_reply(data,1,0.0002)
++        code,r=self.capture();self.assertEqual(code,0);self.assertEqual(r.raw_length,len(data))
++        cmd=b'BX:080B';self.assertEqual(self.commands[0],cmd+('%04X'%crc16(cmd)).encode()+b'\r')
++        self.assertEqual(r.command_wire_bytes,12)
++        self.assertGreater(r.receive_monotonic_ns,r.command_start_monotonic_ns)
++        self.assertGreater(r.receive_wall_ns,r.receive_monotonic_ns)
++    def test_long_fragmented_reply(self):
++        data=packet([tool(i+1,markers={j:(3,[i,j,100],0) for j in range(20)}) for i in range(24)])
++        self.send_reply(data,17,0.0001);code,r=self.capture(3000)
++        self.assertEqual((code,r.tool_count),(0,24));self.assertGreater(r.raw_length,2047)
++    def test_timeout_records_no_old_points(self):
++        self.send_reply(None);code,r=self.capture(60)
++        self.assertEqual((code,r.raw_length,r.tool_count),(0x103,0,0))
++    def test_partial_timeout_keeps_actual_prefix(self):
++        self.send_reply(b'\xc4\xa5');code,r=self.capture(60)
++        self.assertEqual(code,0x103);self.assertEqual(bytes(r.raw[:r.raw_length]),b'\xc4\xa5')
++    def test_header_crc_rejects_before_body(self):
++        data=bytearray(packet([tool()]));data[4]^=1
++        self.send_reply(bytes(data));code,r=self.capture();self.assertEqual(code,0x100);self.assertEqual(r.raw_length,6)
++    def test_unsupported_device_no_fallback(self):
++        self.send_reply(error_reply(1));code,r=self.capture();self.assertEqual(code,1);self.assertEqual(len(self.commands),1)
++    def test_recovery_after_crc_error_and_reconnect(self):
++        data=bytearray(packet([tool()]));data[-1]^=1
++        self.send_reply(bytes(data));self.assertEqual(self.capture()[0],0x100)
++        old=(C.c_float*8)(*([99]*8));self.assertNotEqual(LIB.ndiGetBXTransform(self.device,1,old),0)
++        self.assertEqual(list(old),[99]*8)
++        # No second query/flush in the uncertain connection, even for a valid late reply.
++        os.write(self.master,packet([tool(frame=9,markers={0:(3,[7,8,9],0)})]))
++        code,r=self.capture();self.assertEqual(code,0x204);self.assertEqual(r.command_wire_bytes,0)
++        self.assertFalse(r.valid);self.assertEqual(r.tool_count,0)
++        LIB.ndiCloseSerial(self.device);self.device=LIB.ndiOpenSerial(self.path.encode())
++        self.send_reply(packet([tool(frame=1)]));self.assertEqual(self.capture()[0],0x205)
++        self.send_reply(packet([tool(frame=2)]));self.assertEqual(self.capture()[0],0)
++    def test_paced_writer_is_still_used(self):
++        before=os.environ.get('NDICAPI_SERIAL_WRITE_DELAY_US')
++        os.environ['NDICAPI_SERIAL_WRITE_DELAY_US']='1500'
++        try:
++            self.send_reply(packet([tool()]));code,r=self.capture()
++            self.assertEqual(code,0);self.assertGreater(r.receive_monotonic_ns-r.command_start_monotonic_ns,12_000_000)
++        finally:
++            if before is None:os.environ.pop('NDICAPI_SERIAL_WRITE_DELAY_US',None)
++            else:os.environ['NDICAPI_SERIAL_WRITE_DELAY_US']=before
++    def test_missing_pose_preserves_legacy_getter_status(self):
++        self.send_reply(packet([tool(frame=8)]));self.assertEqual(self.capture()[0],0)
++        present=(C.c_float*8)();self.assertEqual(LIB.ndiGetBXTransform(self.device,1,present),0)
++        self.assertEqual(list(present)[4:7],[100,200,300])
++        self.send_reply(packet([tool(frame=9,status=2,markers={0:(3,[7,8,9],0)})]))
++        code,r=self.capture();self.assertEqual(code,0);self.assertFalse(r.tools[0].pose_present)
++        missing=(C.c_float*8)(*([99]*8))
++        self.assertNotEqual(LIB.ndiGetBXTransform(self.device,1,missing),0)
++        # The existing getter copies its cached matrix even with MISSING status.
++        # Preserve that status-bearing legacy behavior; the NEW snapshot has no pose.
++        self.assertEqual(list(missing),list(present))
++        self.assertEqual(list(r.tools[0].pose),[0]*8)
++        self.assertEqual(list(r.tools[0].markers[0].xyz),[7,8,9])
++    def test_disabled_preserves_legacy_status_cache_but_snapshot_unavailable(self):
++        self.send_reply(packet([tool(frame=8)]));self.assertEqual(self.capture()[0],0)
++        self.send_reply(packet([tool(status=4)]));code,r=self.capture();self.assertEqual(code,0)
++        self.assertFalse(r.tools[0].frame_available);self.assertFalse(r.tools[0].pose_present)
++        self.assertEqual(r.tools[0].marker_count,0)
++        self.assertEqual(LIB.ndiGetBXPortStatus(self.device,1),0x31)
++        self.assertEqual(LIB.ndiGetBXFrame(self.device,1),8)
++        matrix=(C.c_float*8)();self.assertNotEqual(LIB.ndiGetBXTransform(self.device,1,matrix),0)
++
++if __name__=='__main__':unittest.main(verbosity=2)
+diff --git a/Testing/Spectra/tests/test_reset_recovery.py b/Testing/Spectra/tests/test_reset_recovery.py
+new file mode 100644
+index 0000000..4783e57
+--- /dev/null
++++ b/Testing/Spectra/tests/test_reset_recovery.py
+@@ -0,0 +1,34 @@
++"""Strict reset evidence tests on one owned PTY, no physical device access."""
++import ctypes as C
++import os,pty,threading,time,unittest
++from test_bx_capture import LIB,Capture
++class Reset(C.Structure):
++ _fields_=[('verified',C.c_int),('error_code',C.c_int),('raw_length',C.c_uint),('start_monotonic_ns',C.c_uint64),('done_monotonic_ns',C.c_uint64),('raw',C.c_ubyte*1024)]
++LIB.ndiBXResetForRecovery.argtypes=[C.c_void_p,C.c_uint,C.POINTER(Reset)]
++class RecoveryTests(unittest.TestCase):
++ def attempt(self,wire):
++  master,slave=pty.openpty();path=os.ttyname(slave);self.assertTrue(path.startswith('/dev/pts/'))
++  api=LIB.ndiOpenSerial(path.encode());self.assertTrue(api)
++  def peer():
++   time.sleep(.05)
++   if wire:os.write(master,wire)
++  thread=threading.Thread(target=peer);thread.start()
++  try:
++   report=Reset();start=time.monotonic();code=LIB.ndiBXResetForRecovery(api,200,C.byref(report));elapsed=time.monotonic()-start
++   reply=Capture();after=LIB.ndiCaptureBX(api,0x080b,100,C.byref(reply))
++   self.assertNotEqual(after,0);self.assertFalse(reply.valid);self.assertEqual(reply.command_wire_bytes,0)
++   self.assertLess(elapsed,.7);self.assertGreaterEqual(report.done_monotonic_ns,report.start_monotonic_ns)
++   return code,report
++  finally:thread.join();LIB.ndiCloseSerial(api);os.close(master);os.close(slave)
++ def test_full_reset_with_stale_prefix(self):
++  code,r=self.attempt(b'old-BX-bytes\rRESETBE6F\r');self.assertEqual(code,0);self.assertEqual(r.verified,1);self.assertEqual(bytes(r.raw[:r.raw_length]),b'old-BX-bytes\rRESETBE6F\r')
++ def test_wrong_crc_is_not_recovery(self):
++  code,r=self.attempt(b'RESETBE6E\r');self.assertNotEqual(code,0);self.assertFalse(r.verified)
++ def test_missing_cr_is_not_recovery(self):
++  code,r=self.attempt(b'RESETBE6F');self.assertNotEqual(code,0);self.assertFalse(r.verified)
++ def test_silence_is_not_recovery(self):
++  code,r=self.attempt(b'');self.assertNotEqual(code,0);self.assertFalse(r.verified)
++ def test_good_bx_is_not_reset_evidence(self):
++  from bx_fixtures import packet,tool
++  code,r=self.attempt(packet([tool()]));self.assertNotEqual(code,0);self.assertFalse(r.verified)
++if __name__=='__main__':unittest.main(verbosity=2)
+diff --git a/Testing/Spectra/tests/test_serial_compat.py b/Testing/Spectra/tests/test_serial_compat.py
+new file mode 100644
+index 0000000..16f57bd
+--- /dev/null
++++ b/Testing/Spectra/tests/test_serial_compat.py
+@@ -0,0 +1,170 @@
++"""Exercise the installed NDI library against a PTY; no physical device needed."""
++
++import ctypes
++import os
++from pathlib import Path
++import pty
++import select
++import threading
++import time
++import unittest
++
++
++LIBRARY = Path(os.environ.get(
++    "NDICAPI_LIBRARY",
++    str(Path(__file__).resolve().parents[1] / "PlusBuild-bin/bin/libndicapi.so"),
++))
++LIB = ctypes.CDLL(str(LIBRARY))
++LIB.ndiSerialOpen.argtypes = [ctypes.c_char_p]
++LIB.ndiSerialClose.argtypes = [ctypes.c_int]
++LIB.ndiSerialComm.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
++LIB.ndiSerialTimeout.argtypes = [ctypes.c_int, ctypes.c_int]
++LIB.ndiSerialRead.argtypes = [
++    ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_bool,
++    ctypes.POINTER(ctypes.c_int),
++]
++LIB.ndiSerialProbe.argtypes = [ctypes.c_char_p, ctypes.c_bool]
++
++
++class SerialReadTests(unittest.TestCase):
++    def setUp(self):
++        self.master, slave = pty.openpty()
++        self.fd = LIB.ndiSerialOpen(os.ttyname(slave).encode())
++        os.close(slave)
++        self.assertGreaterEqual(self.fd, 0)
++        self.assertEqual(LIB.ndiSerialComm(self.fd, 9600, b"8N1", 0), 0)
++        self.assertEqual(LIB.ndiSerialTimeout(self.fd, 200), 0)
++
++    def tearDown(self):
++        LIB.ndiSerialClose(self.fd)
++        os.close(self.master)
++
++    def receive(self, chunks, capacity, binary=False):
++        def send():
++            for chunk in chunks:
++                time.sleep(0.025)
++                os.write(self.master, chunk)
++
++        sender = threading.Thread(target=send)
++        sender.start()
++        # The extra allocation safely detects writes beyond the declared capacity.
++        buffer = ctypes.create_string_buffer(b"\xcc" * (capacity + 32))
++        error = ctypes.c_int(0)
++        count = LIB.ndiSerialRead(self.fd, buffer, capacity, binary, ctypes.byref(error))
++        sender.join()
++        self.assertEqual(buffer.raw[capacity:], b"\xcc" * 32 + b"\0")
++        return count, buffer.raw[:max(count, 0)], error.value
++
++    def test_fragmented_ascii(self):
++        count, data, _ = self.receive([b"OK", b"AYA8", b"96\r"], 32)
++        self.assertEqual((count, data), (9, b"OKAYA896\r"))
++
++    def test_fragmented_ascii_respects_capacity(self):
++        count, data, _ = self.receive([b"1234567890", b"123456789\r"], 16)
++        self.assertEqual((count, data), (16, b"1234567890123456"))
++
++    def test_fragmented_binary_header_and_body(self):
++        packet = b"\xc4\xa5\x04\x00\x11\x22abcd\x33\x44"
++        count, data, _ = self.receive([packet[:1], packet[1:3], packet[3:6], packet[6:]], 64, True)
++        self.assertEqual((count, data), (len(packet), packet))
++
++    def test_binary_declared_length_exceeds_capacity(self):
++        count, _, error = self.receive([b"\xc4\xa5\xff\xff"], 16, True)
++        self.assertEqual((count, error), (-1, 0x0201))
++
++    def test_binary_error_reply(self):
++        count, data, _ = self.receive([b"ER", b"ROR01", b"ABCD\r"], 32, True)
++        self.assertEqual((count, data), (12, b"ERROR01ABCD\r"))
++
++    def test_timeout(self):
++        count, _, _ = self.receive([], 32)
++        self.assertEqual(count, 0)
++
++
++class ProbeTests(unittest.TestCase):
++    def probe(self, reset_noise):
++        master, slave = pty.openpty()
++        path = os.ttyname(slave).encode()
++        commands = []
++        failures = []
++
++        def command():
++            result = b""
++            deadline = time.monotonic() + 2
++            while not result.endswith(b"\r"):
++                if time.monotonic() >= deadline:
++                    raise TimeoutError(f"command incomplete: {result!r}")
++                if select.select([master], [], [], 0.05)[0]:
++                    result += os.read(master, 1024)
++            commands.append(result)
++            return result
++
++        def device():
++            try:
++                if command() != b"INIT:E3A5\r":
++                    raise AssertionError(commands)
++                if reset_noise is not None:
++                    # Replay the real trace: a bad initial byte, then reset noise
++                    # before a fragmented, valid RESET frame after the break.
++                    os.write(master, b"\xf0")
++                    time.sleep(0.35)
++                    os.write(master, reset_noise)
++                    for part in [b"RESE", b"TBE6F\r"]:
++                        time.sleep(0.01)
++                        os.write(master, part)
++                    if command() != b"INIT:E3A5\r":
++                        raise AssertionError(commands)
++                os.write(master, b"OKAYA896\r")
++                if command() != b"GETINFO:Features.Firmware.Version0492\r":
++                    raise AssertionError(commands)
++                os.write(master, b"ERROR01ABCD\r")
++                if command() != b"VER:065EE\r":
++                    raise AssertionError(commands)
++                os.write(master, b"POLARIS Spectra test firmware0000\r")
++            except Exception as exc:
++                failures.append(exc)
++
++        emulator = threading.Thread(target=device)
++        emulator.start()
++        try:
++            result = LIB.ndiSerialProbe(path, False)
++            emulator.join(timeout=3)
++            self.assertFalse(emulator.is_alive())
++            self.assertEqual(result, 0, f"probe returned {result}; device errors: {failures}")
++            self.assertFalse(failures, str(failures))
++        finally:
++            emulator.join(timeout=3)
++            os.close(master)
++            os.close(slave)
++
++    def test_clean_probe(self):
++        self.probe(None)
++
++    def test_probe_with_real_reset_noise(self):
++        self.probe(bytes.fromhex("f8 f8 f8 fc fc fe ff f8 fc fe"))
++
++    def test_probe_with_noise_ending_in_carriage_return(self):
++        self.probe(b"\xff\r")
++
++    def test_probe_rejects_invalid_reset_crc(self):
++        master, slave = pty.openpty()
++
++        def device():
++            select.select([master], [], [], 2)
++            os.read(master, 1024)
++            os.write(master, b"\xf0")
++            time.sleep(0.35)
++            os.write(master, b"RESET0000\r" + b"x" * 1024)
++
++        emulator = threading.Thread(target=device)
++        emulator.start()
++        try:
++            self.assertEqual(LIB.ndiSerialProbe(os.ttyname(slave).encode(), False), 0x0201)
++        finally:
++            emulator.join(timeout=3)
++            os.close(master)
++            os.close(slave)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/Testing/Spectra/tests/test_transport_deadlines.py b/Testing/Spectra/tests/test_transport_deadlines.py
+new file mode 100644
+index 0000000..c6dd926
+--- /dev/null
++++ b/Testing/Spectra/tests/test_transport_deadlines.py
+@@ -0,0 +1,146 @@
++"""Offline PTY deadline and late-reply tests; subprocess deadlines bound regressions.
++
++All injected faults target only a /dev/pts endpoint. No physical serial device.
++"""
++import ctypes as C
++import fcntl
++import json
++import os
++from pathlib import Path
++import pty
++import select
++import subprocess
++import sys
++import threading
++import time
++import unittest
++from bx_fixtures import packet,tool,error_reply
++from test_bx_capture import LIB,Capture
++
++ROOT=Path(__file__).resolve().parents[1]
++LIB.ndiSerialOpen.argtypes=[C.c_char_p]
++LIB.ndiSerialClose.argtypes=[C.c_int]
++LIB.ndiSerialTimeout.argtypes=[C.c_int,C.c_int]
++LIB.ndiSerialRead.argtypes=[C.c_int,C.c_void_p,C.c_int,C.c_bool,C.POINTER(C.c_int)]
++LIB.ndiSerialWrite.argtypes=[C.c_int,C.c_char_p,C.c_int]
++LIB.ndiSerialWriteDeadline.argtypes=[C.c_int,C.c_char_p,C.c_int,C.c_uint64]
++LIB.ndiSerialProbe.argtypes=[C.c_char_p,C.c_bool]
++
++def worker(mode):
++    master,slave=pty.openpty();path=os.ttyname(slave);assert path.startswith('/dev/pts/')
++    os.environ['NDI_TEST_SERIAL_PATH']=path
++    result={'case':mode,'source':'SYNTHETIC_PTY_ONLY'}
++    if mode.startswith('generic_'):
++        fault=mode[len('generic_'):];os.environ['NDI_TEST_SERIAL_FAULT']=fault
++        fd=LIB.ndiSerialOpen(path.encode());assert fd>=0;LIB.ndiSerialTimeout(fd,100)
++        data=C.create_string_buffer(1000000);error=C.c_int(0);flags_before=fcntl.fcntl(fd,fcntl.F_GETFL)
++        if fault.startswith('read') or fault=='poll_eintr':os.write(master,b'X')
++        started=time.monotonic()
++        if fault.startswith('write') or fault in ('zero_write','blocked_write','short_write'):
++            n=1000000 if fault=='blocked_write' else 12
++            code=LIB.ndiSerialWrite(fd,b'X'*n,n)
++        else:code=LIB.ndiSerialRead(fd,data,len(data),False,C.byref(error))
++        result.update(code=code,error=error.value,elapsed=time.monotonic()-started,flags_restored=flags_before==fcntl.fcntl(fd,fcntl.F_GETFL))
++        LIB.ndiSerialClose(fd)
++    elif mode.startswith('reset_'):
++        os.environ['NDI_TEST_SERIAL_FAULT']=mode
++        def peer():
++            buf=b''
++            while not buf.endswith(b'\r'):
++                if select.select([master],[],[],1)[0]:buf+=os.read(master,1024)
++            os.write(master,b'BAD\r');time.sleep(.35);os.write(master,b'R')
++        t=threading.Thread(target=peer);t.start();started=time.monotonic()
++        code=LIB.ndiSerialProbe(path.encode(),False)
++        result.update(code=code,elapsed=time.monotonic()-started);t.join(2)
++    else:
++        api=LIB.ndiOpenSerial(path.encode());assert api
++        def capture(timeout=60):
++            reply=Capture();started=time.monotonic();code=LIB.ndiCaptureBX(api,0x080b,timeout,C.byref(reply))
++            return code,reply,time.monotonic()-started
++        if mode=='paced_deadline':
++            os.environ['NDICAPI_SERIAL_WRITE_DELAY_US']='10000'
++            code,r,elapsed=capture(50);result.update(code=code,elapsed=elapsed,bytes=r.command_wire_bytes,valid=r.valid,state=r.transport_state)
++        elif mode.startswith('capture_write_'):
++            os.environ['NDI_TEST_SERIAL_FAULT']=mode[len('capture_'):]
++            code,r,elapsed=capture();result.update(code=code,elapsed=elapsed,bytes=r.command_wire_bytes,valid=r.valid,state=r.transport_state)
++        elif mode.startswith('late_'):
++            variant=mode[len('late_'):];raw=packet([tool(frame=400,markers={0:(3,[77,88,99],0)})]);commands=[]
++            def peer():
++                command=b''
++                while not command.endswith(b'\r'):
++                    if select.select([master],[],[],1)[0]:command+=os.read(master,1024)
++                commands.append(command)
++                if variant=='partial':os.write(master,raw[:8])
++                if variant=='crc':os.write(master,raw[:-1]+bytes([raw[-1]^1]))
++                time.sleep(.13)
++                os.write(master,error_reply(1) if variant=='ascii' else (raw[8:] if variant=='partial' else raw))
++            t=threading.Thread(target=peer);t.start()
++            a,first,elapsed=capture();b,second,second_elapsed=capture();t.join(2)
++            third,third_reply,_=capture()
++            extra=os.read(master,1024) if select.select([master],[],[],.02)[0] else b''
++            result.update(first=a,second=b,third=third,elapsed=elapsed,second_elapsed=second_elapsed,
++                          first_raw=first.raw_length,second_raw=second.raw_length,second_valid=second.valid,
++                          second_bytes=second.command_wire_bytes,second_device_error=second.device_error_code,
++                          second_receive=second.receive_monotonic_ns,extra_command_hex=extra.hex(),command_count=len(commands))
++        elif mode=='recovery_first':
++            responses=[packet([tool(frame=f)]) for f in (1,9,9,8)]
++            def peer():
++                for raw in responses:
++                    buf=b''
++                    while not buf.endswith(b'\r'):
++                        if select.select([master],[],[],1)[0]:buf+=os.read(master,1024)
++                    os.write(master,raw)
++            t=threading.Thread(target=peer);t.start();rows=[]
++            for _ in responses:
++                code,r,elapsed=capture(500);rows.append({'code':code,'valid':r.valid,'decoded':r.reply_decoded,'state':r.transport_state,'verified':r.request_association_verified,'tools':r.tool_count,'frame':r.tools[0].frame_number if r.tool_count else None})
++            t.join(2);result['rows']=rows
++        LIB.ndiCloseSerial(api)
++    os.close(master);os.close(slave)
++    print(json.dumps(result))
++
++class DeadlineTests(unittest.TestCase):
++    def case(self,mode,timeout=3):
++        env=dict(os.environ,LD_PRELOAD=str(ROOT/'bin/fault_shim.so'),LD_LIBRARY_PATH=str(ROOT/'bin'))
++        p=subprocess.run([sys.executable,'-B',str(Path(__file__).resolve()),'--worker',mode],capture_output=True,text=True,env=env,timeout=timeout)
++        self.assertEqual(p.returncode,0,p.stderr)
++        value=json.loads(p.stdout)
++        if mode.startswith('generic_'):self.assertTrue(value['flags_restored'])
++        with (ROOT/'audit/deadline-cases.jsonl').open('a') as f:f.write(json.dumps(value)+'\n')
++        return value
++    def test_read_eagain_eintr_and_poll_eintr_have_whole_operation_deadlines(self):
++        for mode in ('read_eagain','read_eintr','poll_eintr'):
++            with self.subTest(mode=mode):
++                v=self.case('generic_'+mode);self.assertEqual(v['code'],0);self.assertGreaterEqual(v['elapsed'],.07);self.assertLess(v['elapsed'],.7)
++    def test_write_eagain_eintr_zero_and_real_full_pty_are_bounded(self):
++        for mode in ('write_eagain','write_eintr','zero_write','blocked_write'):
++            with self.subTest(mode=mode):
++                v=self.case('generic_'+mode);self.assertGreaterEqual(v['code'],0);self.assertLess(v['elapsed'],.7)
++                if mode=='blocked_write':self.assertLess(v['code'],1000000)
++    def test_short_writes_are_completed(self):
++        v=self.case('generic_short_write');self.assertEqual(v['code'],12)
++    def test_capture_timeout_includes_paced_write_and_retry_loops(self):
++        for mode in ('paced_deadline','capture_write_eagain','capture_write_eintr'):
++            with self.subTest(mode=mode):
++                v=self.case(mode);self.assertEqual(v['code'],0x103);self.assertFalse(v['valid']);self.assertEqual(v['state'],3);self.assertLess(v['elapsed'],.7)
++                if mode=='paced_deadline':self.assertGreater(v['bytes'],0);self.assertLess(v['bytes'],12)
++    def test_reset_seven_second_deadline_bounds_inner_eagain_eintr(self):
++        for mode in ('reset_eagain','reset_eintr'):
++            with self.subTest(mode=mode):
++                v=self.case(mode,10);self.assertEqual(v['code'],0x103);self.assertGreater(v['elapsed'],6.9);self.assertLess(v['elapsed'],8.5)
++    def test_late_full_partial_crc_and_ascii_replies_cannot_be_next_request(self):
++        for mode in ('timeout','partial','crc','ascii'):
++            with self.subTest(mode=mode):
++                v=self.case('late_'+mode)
++                self.assertEqual(v['first'],0x100 if mode=='crc' else 0x103)
++                self.assertEqual((v['second'],v['third']),(0x204,0x204));self.assertFalse(v['second_valid'])
++                self.assertEqual((v['second_bytes'],v['second_raw'],v['second_device_error'],v['second_receive']),(0,0,0,0))
++                self.assertEqual(v['extra_command_hex'],'');self.assertEqual(v['command_count'],1);self.assertLess(v['second_elapsed'],.1)
++    def test_first_reply_quarantined_repeats_and_backward_counters_do_not_prove_association(self):
++        rows=self.case('recovery_first')['rows']
++        self.assertEqual((rows[0]['code'],rows[0]['valid'],rows[0]['decoded'],rows[0]['tools']),(0x205,0,1,0))
++        self.assertEqual([r['frame'] for r in rows[1:]],[9,9,8])
++        self.assertTrue(all(not r['verified'] for r in rows));self.assertTrue(all(r['code']==0 for r in rows[1:]))
++
++if __name__=='__main__':
++    if len(sys.argv)>1 and sys.argv[1]=='--worker':worker(sys.argv[2])
++    else:unittest.main(verbosity=2)

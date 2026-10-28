@@ -40,3 +40,7 @@ When making code changes, please follow Plus coding conventions. The Astyle form
 ## License
 
 Plus has a BSD-style license, which allows any kind of use for free. See more details [here](https://github.com/PlusToolkit/PlusLib/blob/master/License.txt).
+
+## Local Spectra branch
+
+This fork carries the opt-in measured BX/raw endpoint and local Linux serial/broadcast fixes. The standard raw endpoint remains disabled by default. Build, companion dependency patches, synthetic/owned-PTY regressions and validation limits are documented in [Testing/Spectra](Testing/Spectra/README.md) and [the profile notes](docs/ndi-raw-v1.md).

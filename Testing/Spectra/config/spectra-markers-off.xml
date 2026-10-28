@@ -1,0 +1,34 @@
+<?xml version='1.0' encoding='utf-8'?>
+<PlusConfiguration version="2.1">
+  <DataCollection StartupDelaySec="1.0">
+    <DeviceSet Name="Spectra Linux test" Description="Two passive tools for RMT Plus client recording" />
+
+    <Device Id="TrackerDevice" Type="NDITracker" BaudRate="115200" CheckDSR="false" AcquisitionRate="20" ToolReferenceFrame="Tracker">
+
+      <DataSources>
+        <DataSource Type="Tool" Id="Test1" RomFile="REPLACE_WITH_PRIVATE_test1.rom" />
+        <DataSource Type="Tool" Id="Test2" RomFile="REPLACE_WITH_PRIVATE_test2.rom" />
+      </DataSources>
+
+      <OutputChannels>
+        <OutputChannel Id="TrackerStream">
+          <DataSource Id="Test1" />
+          <DataSource Id="Test2" />
+        </OutputChannel>
+      </OutputChannels>
+    </Device>
+  </DataCollection>
+
+  <PlusOpenIGTLinkServer ListeningPort="18944" OutputChannelId="TrackerStream" SendValidTransformsOnly="false">
+
+    <DefaultClientInfo ClientHeaderVersion="2">
+      <MessageTypes>
+        <Message Type="TRANSFORM" />
+      </MessageTypes>
+      <TransformNames>
+        <Transform Name="Test1ToTracker" />
+        <Transform Name="Test2ToTracker" />
+      </TransformNames>
+    </DefaultClientInfo>
+  </PlusOpenIGTLinkServer>
+</PlusConfiguration>

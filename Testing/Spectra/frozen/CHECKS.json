@@ -1,0 +1,31 @@
+{
+  "artifact_checks_passed": true,
+  "checks": 1108,
+  "schema_validator": "jsonschema 4.10.3",
+  "python": "3.12.3 (main, Feb  4 2025, 14:48:35) [GCC 13.3.0]",
+  "streams": {
+    "GOLDEN.jsonl": {
+      "records": 3,
+      "frames": 1,
+      "maximum_utf8_bytes": 1740,
+      "digest_verified": true
+    },
+    "GOLDEN-VALID-REPEAT.jsonl": {
+      "records": 4,
+      "frames": 2,
+      "maximum_utf8_bytes": 7056,
+      "digest_verified": true
+    }
+  },
+  "schema_negative_cases": [
+    "schema major",
+    "numeric seq",
+    "unknown key",
+    "invalid slot",
+    "finite XYZ wrong length"
+  ],
+  "limits": "Synthetic contract fixtures; no driver/receiver implementation, serial/network/hardware or actual Plus binary tests.",
+  "igtl_binary_fixtures_verified": true,
+  "wire_header_version": 1,
+  "igtl_string_encoding": 106
+}

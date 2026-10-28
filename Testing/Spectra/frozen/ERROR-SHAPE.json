@@ -1,0 +1,26 @@
+{
+  "schema": "ndi.raw.v1",
+  "schema_minor": 0,
+  "record_type": "error",
+  "source_id": "11111111-1111-4111-8111-111111111111",
+  "acquisition_id": "22222222-2222-4222-8222-222222222222",
+  "session_id": "33333333-3333-4333-8333-333333333333",
+  "seq": "2",
+  "extensions": {},
+  "data": {
+    "code": "QUEUE_OVERFLOW",
+    "scope": "EXPORT",
+    "message": "SYNTHETIC dropped seq 2; demonstration only",
+    "affects_completeness": true,
+    "related_reply_seq": "2",
+    "dropped_seq_first": "2",
+    "dropped_seq_last": "2",
+    "counters": {
+      "frames_considered": "2",
+      "frames_enqueued": "1",
+      "frames_dropped": "1",
+      "frames_sent": "1",
+      "frames_discarded": "0"
+    }
+  }
+}

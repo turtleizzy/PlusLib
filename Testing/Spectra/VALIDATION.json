@@ -1,0 +1,87 @@
+{
+  "schema": "plus.spectra.validation.v1",
+  "classification": "SYNTHETIC_SOCKETPAIR_OWNED_PTY_AND_READ_ONLY_OPTIONAL_RMT",
+  "core_source_matches_local_c3": true,
+  "core_source_sha256": {
+    "src/PlusDataCollection/CMakeLists.txt": "d2997f3b3ba83cf21d683f429d5e13e71522f69cbace5be848ce7a3ba738fe60",
+    "src/PlusDataCollection/NDICAPITracking/PlusNDIMarkerRecorder.cxx": "82958bd979ca00d8b65ff136168e6a2a84a52dc60e4217719378ae0ecb1ab98f",
+    "src/PlusDataCollection/NDICAPITracking/PlusNDIMarkerRecorder.h": "78479e0e7511ad58ef264fc810f7dc904965e4038997e4de7bc51a13fd0bbcfa",
+    "src/PlusDataCollection/NDICAPITracking/PlusNDIRaw.cxx": "270a2235cd987783707be199a5bba6debe1104b9f0bcd0193d6b29daf2315d40",
+    "src/PlusDataCollection/NDICAPITracking/PlusNDIRaw.h": "b6aa722f56a0929d7521a9b4ef2131fdc9af781d8087524673705f8527ca52a0",
+    "src/PlusDataCollection/NDICAPITracking/vtkPlusNDITracker.cxx": "5ca61c112d80265ac1b06d9f64321df1c0c83a4e5bd012f557a9c0b7ad4bf3c3",
+    "src/PlusDataCollection/NDICAPITracking/vtkPlusNDITracker.h": "4d8558e9743ae4f2d8fe04f49f6d17dad37a53d16b49c8c04e9f3640b7d5c052",
+    "src/PlusDataCollection/vtkPlusBuffer.cxx": "c94596d24be6bbaaff8fc19eef93d174767ec81fdc29843cee48e9a811f6c509",
+    "src/PlusDataCollection/vtkPlusBuffer.h": "920ea2faba11b1ec7619fb15d8f8ae159c22dc6ebcf5619a7ea119fe995bef16",
+    "src/PlusDataCollection/vtkPlusChannel.cxx": "917475c1a1c299b288113a3ff1757b4feb4c32ed8b75393b8bc8ae50495cd8b0",
+    "src/PlusOpenIGTLink/PlusIgtlClientInfo.cxx": "7939c707f10e46395a8817dd7e0fb378de361b618b8c207c992afd99017cbd69",
+    "src/PlusServer/PlusReusableServerSocket.h": "81cc771ed1d67c48a8bf66951dc00485e8db058872ab5f44311283342738e804",
+    "src/PlusServer/Tools/PlusServer.cxx": "492913156f44cef2b45fe1c895f578b9acdc654aa6f052adf36cbe6804a8a273",
+    "src/PlusServer/vtkPlusOpenIGTLinkServer.cxx": "4180ac49d30894dcfc722afc3261d11be4464c37ba21eff3ae77864c90691588",
+    "src/PlusServer/vtkPlusOpenIGTLinkServer.h": "dd34f9922e24a529478c28967a4d31c170137eab9cb9ec4b1168c946d87d5451"
+  },
+  "portable_groups": {
+    "test_broadcast_cursor.py.log": {
+      "executions": 6,
+      "skipped": 1,
+      "result": "PASS"
+    },
+    "test_consumer.py.log": {
+      "executions": 4,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    "test_endpoint_startup.py.log": {
+      "executions": 5,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    "test_failed_server_cleanup.py.log": {
+      "executions": 1,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    "test_lifecycle_faults.py.log": {
+      "executions": 9,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    "test_raw.py.log": {
+      "executions": 19,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    "test_raw_recovery_pty.py.log": {
+      "executions": 2,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    "test_raw_tcp.py.log": {
+      "executions": 4,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    "test_recorder.py.log": {
+      "executions": 9,
+      "skipped": 0,
+      "result": "PASS"
+    }
+  },
+  "portable_method_executions": 59,
+  "portable_skipped": 1,
+  "portable_passed": 58,
+  "clientinfo_xml_cases": 5,
+  "companion_ndicapi_methods_passed": 67,
+  "dependency_patch_tree_verified": true,
+  "physical_device_opened_by_portable_runner": false,
+  "prior_reference_validation": {
+    "local_c3_methods_passed": 142,
+    "hardware_smoke": "Transport/storage only; both tools OUT_OF_VIEW; no valid pose/marker claim"
+  },
+  "unverified": [
+    "Windows/MSVC/PlusApp/upstream dashboard matrix",
+    "Cold dependency build",
+    "Physical accuracy/visibility-transition and longer dual-run acceptance",
+    "Historical writer stalls/lock contention and older sampling-filter rejects"
+  ],
+  "privacy": "No private ROMs, live coordinates, receiver archives or local logs committed"
+}

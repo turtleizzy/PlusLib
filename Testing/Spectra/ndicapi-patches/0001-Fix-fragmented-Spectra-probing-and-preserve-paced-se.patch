@@ -1,0 +1,188 @@
+From a7f1bb0056f7942dea3e4fd5c9049977dad2fca5 Mon Sep 17 00:00:00 2001
+From: agnimon <agnimon.codex1@gmail.com>
+Date: Wed, 28 Oct 2026 17:45:24 +0800
+Subject: [PATCH 1/4] Fix fragmented Spectra probing and preserve paced serial
+ writes
+
+Handle fragmented and binary serial replies without conflating a short read with completion. Retain the configured NDICAPI_SERIAL_WRITE_DELAY_US inter-byte pacing. This records the existing local Linux transport repair on the pinned upstream base.
+---
+ ndicapi.cxx             | 39 ++++++++++++++++++++-----------
+ ndicapi_serial_unix.cxx | 52 ++++++++++++++++++++++++++++++++++-------
+ 2 files changed, 69 insertions(+), 22 deletions(-)
+
+diff --git a/ndicapi.cxx b/ndicapi.cxx
+index 454e2a7..83ffdd0 100644
+--- a/ndicapi.cxx
++++ b/ndicapi.cxx
+@@ -43,6 +43,7 @@ POSSIBILITY OF SUCH DAMAGES.
+ #include <string.h>
+ #include <stdlib.h>
+ #include <iostream>
++#include <chrono>
+ 
+ #include <stdio.h>
+ #include <math.h>
+@@ -797,24 +798,36 @@ ndicapiExport int ndiSerialProbe(const char* device, bool checkDSR)
+       return NDI_BAD_COMM;
+     }
+ 
+-    n = ndiSerialRead(serial_port, init_reply, 16, false, &errorCode);
+-    if (n < 0)
++    // Local robustness fix (2026-10-25): the USB converter can emit
++    // baud-transition noise before RESET. Resynchronize on the complete
++    // reset reply, including its CRC, with both a byte and a time limit.
++    const char resetReply[] = "RESETBE6F\r";
++    int matched = 0;
++    int scanned = 0;
++    const auto resetDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
++    ndiSerialTimeout(serial_port, 100);
++    while (matched < 10 && scanned < 1024 && std::chrono::steady_clock::now() < resetDeadline)
+     {
+-      ndiSerialClose(serial_port);
+-      return errorCode;
+-    }
+-    else if (n == 0)
+-    {
+-      ndiSerialClose(serial_port);
+-      return NDI_TIMEOUT;
++      char received;
++      n = ndiSerialRead(serial_port, &received, 1, false, &errorCode);
++      if (n < 0)
++      {
++        ndiSerialClose(serial_port);
++        return errorCode;
++      }
++      if (n == 0)
++      {
++        continue;
++      }
++      ++scanned;
++      matched = (received == resetReply[matched]) ? matched + 1 : (received == 'R' ? 1 : 0);
+     }
+-
+-    // check reply from reset
+-    if (strncmp(init_reply, "RESETBE6F\r", 10) != 0)
++    if (matched != 10)
+     {
+       ndiSerialClose(serial_port);
+-      return NDI_BAD_REPLY;
++      return scanned >= 1024 ? NDI_BAD_REPLY : NDI_TIMEOUT;
+     }
++    ndiSerialTimeout(serial_port, 7000);
+     // try to initialize a second time
+     ndiSerialSleep(serial_port, 100);
+     n = ndiSerialWrite(serial_port, "INIT:E3A5\r", 10);
+diff --git a/ndicapi_serial_unix.cxx b/ndicapi_serial_unix.cxx
+index 028b384..d5e49f4 100644
+--- a/ndicapi_serial_unix.cxx
++++ b/ndicapi_serial_unix.cxx
+@@ -52,6 +52,8 @@ POSSIBILITY OF SUCH DAMAGES.
+ #include <fcntl.h>
+ #include <termios.h>
+ 
++#include "ndicapi.h"
++
+ //----------------------------------------------------------------------------
+ // Some static variables to keep track of which ports are open, so that
+ // we can restore the comm parameters (baud rate etc) when they are closed.
+@@ -384,10 +386,23 @@ ndicapiExport int ndiSerialWrite(int serial_port, const char* text, int n)
+ {
+   int i = 0;
+   int m;
++  // Optional local compatibility setting (2026-10-26): paced writes avoid
++  // CRC errors/timeouts observed on this Spectra USB serial link.
++  long writeDelayUs = 0;
++  const char* delaySetting = getenv("NDICAPI_SERIAL_WRITE_DELAY_US");
++  if (delaySetting)
++  {
++    char* end = NULL;
++    long requestedDelay = strtol(delaySetting, &end, 10);
++    if (end != delaySetting && *end == '\0' && requestedDelay > 0 && requestedDelay <= 10000)
++    {
++      writeDelayUs = requestedDelay;
++    }
++  }
+ 
+   while (n > 0)
+   {
+-    if ((m = write(serial_port, &text[i], n)) == -1)
++    if ((m = write(serial_port, &text[i], writeDelayUs > 0 ? 1 : n)) == -1)
+     {
+       if (errno == EAGAIN)   /* system canceled us, retry */
+       {
+@@ -401,6 +416,10 @@ ndicapiExport int ndiSerialWrite(int serial_port, const char* text, int n)
+ 
+     n -= m;  /* n is number of chars left to write */
+     i += m;  /* i is the number of chars written */
++    if (m > 0 && n > 0 && writeDelayUs > 0)
++    {
++      usleep(writeDelayUs);
++    }
+   }
+ 
+   return i;  /* return the number of characters written */
+@@ -409,21 +428,30 @@ ndicapiExport int ndiSerialWrite(int serial_port, const char* text, int n)
+ //----------------------------------------------------------------------------
+ ndicapiExport int ndiSerialRead(int serial_port, char* reply, int numberOfBytesToRead, bool isBinary, int* errorCode)
+ {
++  // Local robustness fix (2026-10-25): fragmented reads must stay within
++  // the caller's capacity, including while assembling a binary header.
+   int totalNumberOfBytesRead = 0;
+   int totalNumberOfBytesToRead = numberOfBytesToRead;
+   int numberOfBytesRead;
+   bool binarySizeCalculated = false;
+ 
+-  do
++  while (totalNumberOfBytesRead < totalNumberOfBytesToRead)
+   {
+-    if ((numberOfBytesRead = read(serial_port, &reply[totalNumberOfBytesRead], numberOfBytesToRead)) == -1)
++    int remaining = totalNumberOfBytesToRead - totalNumberOfBytesRead;
++    if (isBinary && !binarySizeCalculated && totalNumberOfBytesRead < 4 &&
++        remaining > 4 - totalNumberOfBytesRead)
++    {
++      remaining = 4 - totalNumberOfBytesRead;
++    }
++    if ((numberOfBytesRead = read(serial_port, &reply[totalNumberOfBytesRead], remaining)) == -1)
+     {
+-      if (errno == EAGAIN) /* canceled, so retry */
++      if (errno == EAGAIN || errno == EINTR) /* canceled, so retry */
+       {
+-        numberOfBytesRead = 0;
++        continue;
+       }
+       else
+       {
++        if (errorCode) { *errorCode = NDI_READ_ERROR; }
+         return -1; /* IO error occurred */
+       }
+     }
+@@ -434,19 +462,25 @@ ndicapiExport int ndiSerialRead(int serial_port, char* reply, int numberOfBytesT
+ 
+     totalNumberOfBytesRead += numberOfBytesRead;
+     if ((!isBinary && reply[totalNumberOfBytesRead - 1] == '\r')      /* done when carriage return received (ASCII) or when ERROR... received (binary)*/
+-        || (isBinary && strncmp(reply, "ERROR", 5) == 0 && reply[totalNumberOfBytesRead - 1] == '\r'))
++        || (isBinary && totalNumberOfBytesRead >= 5 && strncmp(reply, "ERROR", 5) == 0 && reply[totalNumberOfBytesRead - 1] == '\r'))
+     {
+       break;
+     }
+ 
+-    if (isBinary && !binarySizeCalculated && reply[0] == (char)0xc4 && reply[1] == (char)0xa5)
++    if (isBinary && !binarySizeCalculated && totalNumberOfBytesRead >= 4 &&
++        reply[0] == (char)0xc4 && reply[1] == (char)0xa5)
+     {
+       // recalculate n based on the reply length (reported from ndi device) and the amount of data received so far
+-      unsigned short size = ((unsigned char)reply[2] | (unsigned char)reply[3] << 8) + 8; // 8 bytes -> 2 for Start Sequence (a5c4), 2 for reply length, 2 for header CRC, 2 for CRC16
++      unsigned int size = ((unsigned char)reply[2] | (unsigned char)reply[3] << 8) + 8; // 8 bytes -> 2 for Start Sequence (a5c4), 2 for reply length, 2 for header CRC, 2 for CRC16
++      if (size > static_cast<unsigned int>(numberOfBytesToRead))
++      {
++        if (errorCode) { *errorCode = NDI_BAD_REPLY; }
++        return -1;
++      }
+       totalNumberOfBytesToRead = size;
++      binarySizeCalculated = true;
+     }
+   }
+-  while (totalNumberOfBytesRead != totalNumberOfBytesToRead);
+ 
+   return totalNumberOfBytesRead;
+ }

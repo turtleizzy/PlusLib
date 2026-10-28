@@ -1,0 +1,25 @@
+{
+  "source": "SYNTHETIC ONLY",
+  "cases": [
+    "first",
+    "repeat",
+    "partial",
+    "wrap",
+    "unknown",
+    "rebound",
+    "epoch2-reconnect",
+    "bad_crc"
+  ],
+  "first_marker_A_mm": [
+    7,
+    8,
+    1000
+  ],
+  "first_tool_translation_mm": [
+    100,
+    200,
+    300
+  ],
+  "expected_reply_count": 8,
+  "independent_marker_timestamp": null
+}

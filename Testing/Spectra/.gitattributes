@@ -1,0 +1,5 @@
+# Exact frozen data and dependency patch bytes must survive checkout unchanged.
+frozen/** -text
+ndicapi-patches/*.patch -text -whitespace
+dependency-patches/*.patch -text -whitespace
+fixtures/*.jsonl -text

@@ -1,0 +1,647 @@
+From 49181b3c081d8fc8d5671c9c4cccd3b67c08a722 Mon Sep 17 00:00:00 2001
+From: agnimon <agnimon.codex1@gmail.com>
+Date: Wed, 28 Oct 2026 17:45:24 +0800
+Subject: [PATCH 2/4] Capture bounded BX observations with explicit
+ desynchronization
+
+Expose one synchronous BX capture with complete original bytes, CRC and status evidence. Bound shared serial reads and writes with deadlines; latch timeout/partial-reply desynchronization so a late reply is not accepted as a fresh request. Keep transaction association explicitly unverified.
+---
+ CMakeLists.txt          |   2 +
+ ndicapi.cxx             |  22 ++++-
+ ndicapi.h               |   4 +
+ ndicapi_bx_capture.cxx  | 197 +++++++++++++++++++++++++++++++++++++++
+ ndicapi_bx_capture.h    |  64 +++++++++++++
+ ndicapi_serial.h        |  12 +++
+ ndicapi_serial_unix.cxx | 201 +++++++++++++++++++++++-----------------
+ 7 files changed, 417 insertions(+), 85 deletions(-)
+ create mode 100644 ndicapi_bx_capture.cxx
+ create mode 100644 ndicapi_bx_capture.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3e392b0..84949c7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -39,6 +39,7 @@ SET(${PROJECT_NAME}_INCLUDE_DIRS
+ 
+ SET(${PROJECT_NAME}_SRCS
+   ndicapi.cxx
++  ndicapi_bx_capture.cxx
+   ndicapi_math.cxx
+   ndicapi_serial.cxx
+   ndicapi_thread.cxx
+@@ -52,6 +53,7 @@ SET(${PROJECT_NAME}_HDRS
+   ndicapi_thread.h
+   ndicapi_serial.h
+   ndicapi.h
++  ndicapi_bx_capture.h
+   ndicapi_socket.h
+   ${CMAKE_CURRENT_BINARY_DIR}/ndicapiExport.h
+   )
+diff --git a/ndicapi.cxx b/ndicapi.cxx
+index 83ffdd0..a8957b9 100644
+--- a/ndicapi.cxx
++++ b/ndicapi.cxx
+@@ -509,6 +509,8 @@ ndicapiExport int ndiGetSocketError(ndicapi* pol)
+ //----------------------------------------------------------------------------
+ ndicapiExport const char* ndiErrorString(int errnum)
+ {
++  if (errnum == 0x0204) return "BX stream desynchronized; reconnect required";
++  if (errnum == 0x0205) return "First BX reply quarantined; association remains unverified";
+   static const char* textarray_low[] = // values from 0x01 to 0x43
+   {
+     /* 0x01 */ "No error",
+@@ -804,12 +806,25 @@ ndicapiExport int ndiSerialProbe(const char* device, bool checkDSR)
+     const char resetReply[] = "RESETBE6F\r";
+     int matched = 0;
+     int scanned = 0;
++    #if defined(__linux__)
++    const uint64_t resetDeadline = ndiSerialMonotonicNowNS() + 7000000000ULL;
++#else
+     const auto resetDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
++#endif
+     ndiSerialTimeout(serial_port, 100);
+-    while (matched < 10 && scanned < 1024 && std::chrono::steady_clock::now() < resetDeadline)
++    while (matched < 10 && scanned < 1024 &&
++#if defined(__linux__)
++           ndiSerialMonotonicNowNS() < resetDeadline)
++#else
++           std::chrono::steady_clock::now() < resetDeadline)
++#endif
+     {
+       char received;
++      #if defined(__linux__)
++      n = ndiSerialReadDeadline(serial_port, &received, 1, false, &errorCode, resetDeadline);
++#else
+       n = ndiSerialRead(serial_port, &received, 1, false, &errorCode);
++#endif
+       if (n < 0)
+       {
+         ndiSerialClose(serial_port);
+@@ -862,6 +877,11 @@ ndicapiExport int ndiSerialProbe(const char* device, bool checkDSR)
+     }
+   }
+ 
++  if (ndiSerialTimeout(serial_port, 7000) < 0)
++  {
++    ndiSerialClose(serial_port);
++    return NDI_BAD_COMM;
++  }
+   ndiSerialSleep(serial_port, 100);
+   if (ndiSerialWrite(serial_port, "GETINFO:Features.Firmware.Version0492\r", strlen("GETINFO:Features.Firmware.Version0492\r")) != strlen("GETINFO:Features.Firmware.Version0492\r"))
+   {
+diff --git a/ndicapi.h b/ndicapi.h
+index 839c01f..26d0c0d 100644
+--- a/ndicapi.h
++++ b/ndicapi.h
+@@ -204,6 +204,10 @@ struct ndicapi
+   unsigned short Bx2_3DMarkerCount[NDI_MAX_HANDLES];
+   char Bx2_3DMarkerStatus[NDI_MAX_HANDLES][20];
+   float Bx2_3DMarkerPosition[NDI_MAX_HANDLES][20][3]; // a tool can have up to 20 markers
++
++  // Opt-in BX transport: 0 first reply quarantine, 1 ordered assumption, -1 reconnect required.
++  // A failed request must never be cleared by a flush or a frame counter.
++  int BxCaptureSynchronization;
+ };
+ 
+ typedef struct ndicapi ndicapi;
+diff --git a/ndicapi_bx_capture.cxx b/ndicapi_bx_capture.cxx
+new file mode 100644
+index 0000000..8a1494a
+--- /dev/null
++++ b/ndicapi_bx_capture.cxx
+@@ -0,0 +1,197 @@
++/* Local opt-in measured-marker implementation. License: see ndicapi.h. */
++#include "ndicapi_bx_capture.h"
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <vector>
++#if defined(__linux__)
++#include <cerrno>
++#include <climits>
++#include <poll.h>
++#include <time.h>
++#include <unistd.h>
++#endif
++namespace {
++unsigned int u16(const unsigned char* p) { return unsigned(p[0]) | unsigned(p[1]) << 8; }
++unsigned int u32(const unsigned char* p) { return unsigned(p[0]) | unsigned(p[1]) << 8 | unsigned(p[2]) << 16 | unsigned(p[3]) << 24; }
++int fail(ndiBXCapture* out, int code, const char* why)
++{
++  out->valid=0; out->tool_count=0; out->error_code=code;
++  std::snprintf(out->error_message,sizeof(out->error_message),"%s",why);
++  return code;
++}
++struct Cursor {
++  const unsigned char* begin; const unsigned char* p; const unsigned char* end;
++  const unsigned char* take(unsigned n) { if (n>unsigned(end-p)) return nullptr; const auto r=p; p+=n; return r; }
++  bool f32(float& f) { const auto q=take(4); if(!q)return false; uint32_t bits=u32(q); std::memcpy(&f,&bits,4); return true; }
++};
++#if defined(__linux__)
++uint64_t now(clockid_t id) { timespec t; if(clock_gettime(id,&t))return 0; return uint64_t(t.tv_sec)*1000000000ULL+t.tv_nsec; }
++#endif
++int finish(ndicapi* api, ndiBXCapture* out, int code)
++{
++  if(code) api->BxHandleCount=0; // no stale getters after a failed opt-in request
++  api->ErrorCode=code;
++  if(code && api->ErrorCallback) api->ErrorCallback(code,const_cast<char*>(out->error_message),api->ErrorCallbackData);
++  return code;
++}
++}
++extern "C" {
++unsigned short ndiBXCaptureCRC16(const unsigned char* data,unsigned int n)
++{
++  unsigned short c=0;
++  for(unsigned i=0;i<n;++i) { c^=data[i]; for(int bit=0;bit<8;++bit)c=(c>>1)^((c&1)?0xa001:0); }
++  return c;
++}
++int ndiDecodeBXCapture(const unsigned char* wire,unsigned int length,unsigned int flags,ndiBXCapture* out)
++{
++  if(!out)return NDI_BAD_REPLY;
++  // Public decoder supports aliasing its own raw buffer.
++  std::vector<unsigned char> copy;
++  if(wire==out->raw && length<=NDI_BX_CAPTURE_MAX_WIRE) { copy.assign(wire,wire+length); wire=copy.data(); }
++  std::memset(out,0,sizeof(*out)); out->header_crc_valid=out->body_crc_valid=-1; out->reply_flags=flags;
++  if(!wire || length>NDI_BX_CAPTURE_MAX_WIRE) return fail(out,NDI_BAD_REPLY,"raw reply exceeds capture capacity");
++  out->raw_length=length; std::memcpy(out->raw,wire,length);
++  if(!(flags&1) || (flags&~0x080bu) || ((flags&8) && !(flags&2)))
++    return fail(out,NDI_BAD_REPLY,"unsupported capture reply flags (strays/BX2 are not implemented)");
++  if(length>=5 && !std::memcmp(wire,"ERROR",5)) {
++    if(length!=12 || wire[length-1]!='\r')return fail(out,NDI_BAD_REPLY,"invalid device error reply length");
++    unsigned crc=0,code=0;
++    for(unsigned i=length-5;i<length-1;++i) { const char ch=wire[i]; if(!((ch>='0'&&ch<='9')||(ch>='A'&&ch<='F')))return fail(out,NDI_BAD_REPLY,"invalid error CRC text"); crc=crc*16+(ch<='9'?ch-'0':ch-'A'+10); }
++    out->body_crc_valid=(ndiBXCaptureCRC16(wire,length-5)==crc);
++    if(!out->body_crc_valid)return fail(out,NDI_BAD_CRC,"device error CRC mismatch");
++    for(unsigned i=5;i<7;++i) { const char ch=wire[i]; if(!((ch>='0'&&ch<='9')||(ch>='A'&&ch<='F')))return fail(out,NDI_BAD_REPLY,"invalid device error code"); code=code*16+(ch<='9'?ch-'0':ch-'A'+10); }
++    out->device_error_code=code; out->reply_decoded=1;
++    return fail(out,code?code:NDI_BAD_REPLY,(code==1||code==7)?"device rejected marker request as unsupported/invalid":"device reported an error");
++  }
++  if(length<8 || wire[0]!=0xc4 || wire[1]!=0xa5)return fail(out,NDI_BAD_REPLY,"invalid/truncated BX header");
++  out->header_crc_valid=(ndiBXCaptureCRC16(wire,4)==u16(wire+4));
++  if(!out->header_crc_valid)return fail(out,NDI_BAD_CRC,"BX header CRC mismatch");
++  if(u16(wire+2)+8u!=length)return fail(out,NDI_BAD_REPLY,"BX wire length differs from header");
++  out->body_crc_valid=(ndiBXCaptureCRC16(wire+6,length-8)==u16(wire+length-2));
++  if(!out->body_crc_valid)return fail(out,NDI_BAD_CRC,"BX payload CRC mismatch");
++  Cursor c={wire,wire+6,wire+length-2}; const auto count=c.take(1);
++  if(!count || *count>NDI_MAX_HANDLES)return fail(out,NDI_BAD_REPLY,"BX handle count exceeds capacity");
++  const unsigned n=*count; bool handles[256]={false};
++  for(unsigned i=0;i<n;++i) {
++    auto& t=out->tools[i]; t.wire_offset=unsigned(c.p-wire);
++    const auto head=c.take(2); if(!head)return fail(out,NDI_BAD_REPLY,"truncated tool header");
++    t.handle=head[0]; t.handle_status=head[1];
++    if(!t.handle || handles[t.handle] || !(t.handle_status==1||t.handle_status==2||t.handle_status==4))
++      return fail(out,NDI_BAD_REPLY,"invalid/duplicate handle or handle status");
++    handles[t.handle]=true;
++    if(t.handle_status!=NDI_HANDLE_DISABLED) {
++      if(t.handle_status!=NDI_HANDLE_MISSING) {
++        t.pose_present=1;
++        for(float& f:t.pose)if(!c.f32(f)||!std::isfinite(f))return fail(out,NDI_BAD_REPLY,"truncated/nonfinite tool pose");
++      }
++      const auto status=c.take(8); if(!status)return fail(out,NDI_BAD_REPLY,"truncated port status/frame");
++      t.port_status=u32(status); t.frame_number=u32(status+4); t.frame_available=1; // frame 0 IS available
++      if(flags&2) {
++        const auto info=c.take(11); if(!info)return fail(out,NDI_BAD_REPLY,"truncated marker identity information");
++        t.additional_info_available=1; t.tool_information=info[0];
++        // Marker A is the low nibble of the LAST of the ten bytes (T..A).
++        for(unsigned j=0;j<20;++j)t.marker_status[j]=(info[1+9-j/2]>>((j%2)*4))&15;
++      }
++      if(flags&8) {
++        const auto num=c.take(1); if(!num || *num>20)return fail(out,NDI_BAD_REPLY,"marker count exceeds tool capacity");
++        t.marker_count=*num; const auto oov=c.take((t.marker_count+7)/8);
++        if(!oov)return fail(out,NDI_BAD_REPLY,"truncated marker out-of-volume bits");
++        unsigned visible[20],visibleCount=0;
++        for(unsigned j=0;j<20;++j)if(t.marker_status[j])visible[visibleCount++]=j;
++        t.marker_identity_known=(visibleCount==t.marker_count);
++        for(unsigned j=0;j<t.marker_count;++j) {
++          auto& m=t.markers[j]; m.label_index=t.marker_identity_known?int(visible[j]):-1;
++          m.status=t.marker_identity_known?t.marker_status[m.label_index]:-1;
++          m.out_of_volume=(oov[j/8]>>(j%8))&1; m.finite=1;
++          for(float& x:m.xyz) { if(!c.f32(x))return fail(out,NDI_BAD_REPLY,"truncated measured marker coordinates"); m.finite&=std::isfinite(x); }
++        }
++      }
++    }
++    t.wire_length=unsigned(c.p-wire)-t.wire_offset;
++  }
++  const auto status=c.take(2); if(!status || c.p!=c.end)return fail(out,NDI_BAD_REPLY,"missing system status or unexplained trailing bytes");
++  out->system_status=u16(status); out->tool_count=n; out->valid=1; out->reply_decoded=1; return NDI_OKAY;
++}
++int ndiCaptureBX(ndicapi* api,unsigned int flags,unsigned int timeout_ms,ndiBXCapture* out)
++{
++  if(!out)return NDI_BAD_REPLY;
++  std::memset(out,0,sizeof(*out)); out->header_crc_valid=out->body_crc_valid=-1; out->reply_flags=flags; out->command_write_count_known=1;
++  if(!api)return fail(out,NDI_OPEN_ERROR,"NDI device is not open");
++#if !defined(__linux__)
++  return finish(api,out,fail(out,NDI_BAD_COMM,"marker capture backend supports Linux synchronous serial only"));
++#else
++  if(api->SerialDevice==NDI_INVALID_HANDLE || api->IsThreadedMode || (flags!=0x0801 && flags!=NDI_BX_CAPTURE_FLAGS) || timeout_ms<50 || timeout_ms>60000)
++    return finish(api,out,fail(out,NDI_BAD_COMM,"marker capture requires synchronous serial, supported flags, and 50..60000 ms timeout"));
++  if(api->BxCaptureSynchronization<0) {
++    out->transport_state=NDI_BX_RECONNECT_REQUIRED;
++    return finish(api,out,fail(out,NDI_BX_CAPTURE_DESYNCHRONIZED,"BX stream desynchronized: close, reconnect and reinitialize; no request was sent"));
++  }
++  const bool firstReply=api->BxCaptureSynchronization==0;
++  char command[16]; std::snprintf(command,sizeof(command),"BX:%04X",flags);
++  unsigned n=unsigned(std::strlen(command)); unsigned crc=ndiBXCaptureCRC16(reinterpret_cast<unsigned char*>(command),n);
++  std::snprintf(command+n,sizeof(command)-n,"%04X\r",crc); n+=5;
++  const uint64_t start=now(CLOCK_MONOTONIC),deadline=start+uint64_t(timeout_ms)*1000000;
++  std::vector<unsigned char> wire(NDI_BX_CAPTURE_MAX_WIRE); unsigned have=0,want=4; int headerVerified=-1; int error=0; const char* why="";
++  // Flush is housekeeping ONLY. It is not a transaction or recovery barrier.
++  ndiSerialFlush(api->SerialDevice,NDI_IFLUSH);
++  const int sent=ndiSerialWriteDeadline(api->SerialDevice,command,n,deadline);
++  if(sent!=int(n)) { error=(now(CLOCK_MONOTONIC)>=deadline)?NDI_TIMEOUT:NDI_WRITE_ERROR; why="BX paced write failed, timed out or was short"; }
++  bool asciiError=false;
++  while(!error && have<want) {
++    uint64_t t=now(CLOCK_MONOTONIC);
++    if(t>=deadline){error=NDI_TIMEOUT;why="BX request deadline exceeded";break;}
++    int readError=NDI_OKAY;
++    const int got=ndiSerialReadSomeDeadline(api->SerialDevice,reinterpret_cast<char*>(wire.data()+have),want-have,deadline,&readError);
++    if(got<=0){error=readError;why=got==0?"BX request deadline exceeded":"BX serial read error";break;}
++    have+=unsigned(got);
++    if(have==4) {
++      if(!std::memcmp(wire.data(),"ERRO",4)){asciiError=true;want=5;}
++      else if(wire[0]==0xc4 && wire[1]==0xa5 && u16(wire.data()+2)>=3)want=6;
++      else {error=NDI_BAD_REPLY;why="BX invalid serial header";}
++    }
++    if(asciiError && have==want) {
++      if(have>=6 && wire[have-1]=='\r')break;
++      if(have>=256){error=NDI_BAD_REPLY;why="oversize device error reply";break;}
++      want=have+1;
++    } else if(have==6 && !asciiError) {
++      headerVerified=(ndiBXCaptureCRC16(wire.data(),4)==u16(wire.data()+4));
++      if(!headerVerified){error=NDI_BAD_CRC;why="BX header CRC mismatch";break;}
++      want=u16(wire.data()+2)+8;
++    }
++  }
++  const uint64_t receive=now(CLOCK_MONOTONIC),wall=now(CLOCK_REALTIME);
++  if(error) { out->raw_length=have;out->header_crc_valid=headerVerified;std::memcpy(out->raw,wire.data(),have);fail(out,error,why); }
++  else error=ndiDecodeBXCapture(wire.data(),have,flags,out);
++  out->command_write_count_known=sent>=0;
++  out->command_wire_bytes=sent>0?unsigned(sent):0; out->request_sent=sent==int(n);
++  out->command_start_monotonic_ns=start;
++  out->receive_monotonic_ns=receive; out->receive_wall_ns=wall; out->decode_done_monotonic_ns=now(CLOCK_MONOTONIC);
++  if(!error && now(CLOCK_MONOTONIC)>=deadline) error=fail(out,NDI_TIMEOUT,"BX decode completed after request deadline");
++  if(!error && firstReply) {
++    // Reopening cannot prove the absence of delayed bytes. Do not publish the
++    // first reply, and do not claim that discarding it eliminates all ambiguity.
++    api->BxCaptureSynchronization=1;
++    out->transport_state=NDI_BX_FIRST_REPLY_QUARANTINED;
++    error=fail(out,NDI_BX_CAPTURE_RECOVERY_REPLY,"first BX reply quarantined; later association assumes serialized protocol order, not a transaction ID");
++  } else if(error) {
++    api->BxCaptureSynchronization=-1;
++    out->transport_state=NDI_BX_RECONNECT_REQUIRED;
++  } else {
++    api->BxCaptureSynchronization=1;
++    out->transport_state=NDI_BX_ORDERED_UNVERIFIED;
++  }
++  if(!error) {
++    api->BxHandleCount=out->tool_count; api->BxReplyLength=static_cast<unsigned short>(have-8); api->BxSystemStatus=out->system_status;
++    for(unsigned i=0;i<out->tool_count;++i) {
++      const auto& t=out->tools[i]; api->BxHandles[i]=char(t.handle);api->BxHandlesStatus[i]=char(t.handle_status);
++      if(t.frame_available) { api->BxPortStatus[i]=int(t.port_status);api->BxFrameNumber[i]=t.frame_number; }
++      if(t.pose_present) std::memcpy(api->BxTransforms[i],t.pose,sizeof(t.pose)); // preserve legacy invalid-pose behavior
++    }
++  }
++  return finish(api,out,error);
++#endif
++}
++}
+diff --git a/ndicapi_bx_capture.h b/ndicapi_bx_capture.h
+new file mode 100644
+index 0000000..5eb8d5d
+--- /dev/null
++++ b/ndicapi_bx_capture.h
+@@ -0,0 +1,64 @@
++/* Local opt-in BX measured-marker capture, 2026-10-26.
++ * Uses the ndicapi license in ndicapi.h. No ROM-derived coordinates. */
++#ifndef NDICAPI_BX_CAPTURE_H
++#define NDICAPI_BX_CAPTURE_H
++#include "ndicapi.h"
++#include <stdint.h>
++#define NDI_BX_CAPTURE_MAX_WIRE 65543u
++#define NDI_BX_CAPTURE_FLAGS 0x080Bu
++#define NDI_BX_CAPTURE_DESYNCHRONIZED 0x0204
++#define NDI_BX_CAPTURE_RECOVERY_REPLY 0x0205
++enum { NDI_BX_DECODER_ONLY=0, NDI_BX_ORDERED_UNVERIFIED=1, NDI_BX_FIRST_REPLY_QUARANTINED=2, NDI_BX_RECONNECT_REQUIRED=3 };
++struct ndiBXCapturedMarker
++{
++  int label_index; /* 0=A..19=T, -1 when identity cannot be matched */
++  int status;      /* 0..5 device nibble; -1 if unavailable */
++  int out_of_volume;
++  int finite;
++  float xyz[3];
++};
++struct ndiBXCapturedTool
++{
++  unsigned int handle, handle_status, port_status, frame_number;
++  int frame_available, pose_present, additional_info_available;
++  float pose[8]; /* q0,qx,qy,qz,tx,ty,tz,fit error: all from this reply */
++  unsigned int tool_information;
++  unsigned char marker_status[20]; /* A..T; zero = missing OR not defined */
++  unsigned int marker_count;
++  int marker_identity_known;
++  ndiBXCapturedMarker markers[20];
++  unsigned int wire_offset, wire_length;
++};
++struct ndiBXCapture
++{
++  int valid, error_code, device_error_code, header_crc_valid, body_crc_valid;
++  char error_message[160];
++  unsigned int reply_flags, tool_count, system_status, raw_length, command_wire_bytes;
++  uint64_t command_start_monotonic_ns, receive_monotonic_ns, receive_wall_ns, decode_done_monotonic_ns;
++  ndiBXCapturedTool tools[NDI_MAX_HANDLES];
++  unsigned char raw[NDI_BX_CAPTURE_MAX_WIRE];
++  int transport_state, request_sent, reply_decoded;
++  int command_write_count_known;
++  // Always false: BX has no transaction identifier. CRC/counters cannot prove association.
++  int request_association_verified;
++};
++#ifdef __cplusplus
++extern "C" {
++#endif
++ndicapiExport unsigned short ndiBXCaptureCRC16(const unsigned char* data, unsigned int length);
++/* Pure bounded decoder; raw wire includes independent header and payload CRCs. */
++ndicapiExport int ndiDecodeBXCapture(const unsigned char* wire, unsigned int length,
++                                   unsigned int flags, ndiBXCapture* result);
++/* One atomic serial request. Caller must hold its existing command lock.
++ * Linux, synchronous serial only. Does not change baud, timeout termios, or rate.
++ * Uses one absolute monotonic deadline for nonblocking paced write and fragmented read.
++ * Any request failure latches reconnect-required; later calls send/flush nothing.
++ * First decoded reply on each newly opened connection is quarantined, never published.
++ * Subsequent association is an explicit serial-order assumption, not proof of freshness.
++ * Only an accepted reply populates legacy BX pose/status getters. */
++ndicapiExport int ndiCaptureBX(ndicapi* api, unsigned int flags, unsigned int timeout_ms,
++                             ndiBXCapture* result);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/ndicapi_serial.h b/ndicapi_serial.h
+index 60f366c..58d10ff 100644
+--- a/ndicapi_serial.h
++++ b/ndicapi_serial.h
+@@ -51,6 +51,7 @@ POSSIBILITY OF SUCH DAMAGES.
+ #define NDICAPI_SERIAL_H
+ 
+ #include "ndicapiExport.h"
++#include <stdint.h>
+ 
+ /*=====================================================================*/
+ /*! \defgroup NDISerial NDI Serial Methods
+@@ -244,6 +245,17 @@ ndicapiExport int ndiSerialWrite(NDIFileHandle serial_port, const char* text, in
+ */
+ ndicapiExport int ndiSerialRead(NDIFileHandle serial_port, char* reply, int n, bool isBinary, int* errorCode);
+ 
++#if defined(__linux__)
++/* Linux absolute CLOCK_MONOTONIC deadlines; caller serializes this FD.
++ * Temporarily nonblocking read/write; restore original file status flags.
++ * 0 read / short write on timeout; not a hard real-time kernel guarantee. */
++ndicapiExport uint64_t ndiSerialMonotonicNowNS();
++ndicapiExport int ndiSerialReadSomeDeadline(NDIFileHandle fd, char* reply, int n, uint64_t deadline, int* error);
++ndicapiExport int ndiSerialReadDeadline(NDIFileHandle fd, char* reply, int n, bool binary, int* error, uint64_t deadline);
++ndicapiExport int ndiSerialWriteDeadline(NDIFileHandle fd, const char* text, int n, uint64_t deadline);
++#endif
++
++
+ /*! \ingroup NDISerial
+   Sleep for the specified number of milliseconds.  The actual sleep time
+   is likely to last for 10ms longer than the specifed time due to
+diff --git a/ndicapi_serial_unix.cxx b/ndicapi_serial_unix.cxx
+index d5e49f4..70cafd1 100644
+--- a/ndicapi_serial_unix.cxx
++++ b/ndicapi_serial_unix.cxx
+@@ -38,6 +38,10 @@ POSSIBILITY OF SUCH DAMAGES.
+ // are of the form ndiSerialXX().
+ 
+ #include <errno.h>
++#include <algorithm>
++#include <climits>
++#include <poll.h>
++#include <stdint.h>
+ #include <time.h>
+ #include <ctype.h>
+ #include <stdio.h>
+@@ -382,109 +386,138 @@ ndicapiExport int ndiSerialTimeout(int serial_port, int milliseconds)
+ }
+ 
+ //----------------------------------------------------------------------------
+-ndicapiExport int ndiSerialWrite(int serial_port, const char* text, int n)
++namespace {
++uint64_t serialNow()
+ {
+-  int i = 0;
+-  int m;
+-  // Optional local compatibility setting (2026-10-26): paced writes avoid
+-  // CRC errors/timeouts observed on this Spectra USB serial link.
+-  long writeDelayUs = 0;
+-  const char* delaySetting = getenv("NDICAPI_SERIAL_WRITE_DELAY_US");
+-  if (delaySetting)
++  timespec t;
++  if (clock_gettime(CLOCK_MONOTONIC, &t)) return 0;
++  return uint64_t(t.tv_sec) * 1000000000ULL + uint64_t(t.tv_nsec);
++}
++class NonblockingSerial
++{
++  int FD, Flags;
++public:
++  explicit NonblockingSerial(int fd) : FD(fd), Flags(fcntl(fd, F_GETFL))
+   {
+-    char* end = NULL;
+-    long requestedDelay = strtol(delaySetting, &end, 10);
+-    if (end != delaySetting && *end == '\0' && requestedDelay > 0 && requestedDelay <= 10000)
+-    {
+-      writeDelayUs = requestedDelay;
+-    }
++    if (Flags >= 0 && !(Flags & O_NONBLOCK) && fcntl(fd, F_SETFL, Flags | O_NONBLOCK) < 0) Flags = -1;
+   }
+-
+-  while (n > 0)
++  ~NonblockingSerial() { if (Flags >= 0 && !(Flags & O_NONBLOCK)) fcntl(FD, F_SETFL, Flags); }
++  bool valid() const { return Flags >= 0; }
++};
++int serialReady(int fd, short events, uint64_t deadline)
++{
++  for (;;)
+   {
+-    if ((m = write(serial_port, &text[i], writeDelayUs > 0 ? 1 : n)) == -1)
+-    {
+-      if (errno == EAGAIN)   /* system canceled us, retry */
+-      {
+-        m = 0;
+-      }
+-      else
+-      {
+-        return -1;  /* IO error occurred */
+-      }
+-    }
+-
+-    n -= m;  /* n is number of chars left to write */
+-    i += m;  /* i is the number of chars written */
+-    if (m > 0 && n > 0 && writeDelayUs > 0)
+-    {
+-      usleep(writeDelayUs);
+-    }
++    const uint64_t t = serialNow();
++    if (!t || t >= deadline) { errno = ETIMEDOUT; return 0; }
++    pollfd p = {fd, events, 0};
++    const uint64_t ms = (deadline - t + 999999ULL) / 1000000ULL;
++    const int ready = poll(&p, 1, int(std::min<uint64_t>(ms, INT_MAX)));
++    if (ready < 0 && errno == EINTR) continue;
++    if (ready < 0) return -1;
++    if (!ready) continue;
++    if (p.revents & (POLLERR | POLLNVAL)) { errno = EIO; return -1; }
++    if (p.revents & events) { if (serialNow() >= deadline) { errno=ETIMEDOUT; return 0; } return 1; }
++    if (p.revents & POLLHUP) { errno = EIO; return -1; }
+   }
++}
++uint64_t serialDefaultDeadline(int fd)
++{
++  termios t;
++  // Match the configured termios timeout, but impose a finite budget even
++  // when VTIME is zero. Deadlines are for a whole operation, not each retry.
++  unsigned ms = TIMEOUT_PERIOD;
++  if (!tcgetattr(fd, &t)) ms = std::max<unsigned>(100, unsigned(t.c_cc[VTIME]) * 100);
++  return serialNow() + uint64_t(ms) * 1000000ULL;
++}
++}
+ 
+-  return i;  /* return the number of characters written */
++ndicapiExport uint64_t ndiSerialMonotonicNowNS() { return serialNow(); }
++
++ndicapiExport int ndiSerialReadSomeDeadline(int fd, char* reply, int n, uint64_t deadline, int* error)
++{
++  NonblockingSerial nonblocking(fd);
++  if (!nonblocking.valid() || n <= 0) { if(error)*error=NDI_READ_ERROR; return -1; }
++  for (;;)
++  {
++    const int ready = serialReady(fd, POLLIN, deadline);
++    if (!ready) { if(error)*error=NDI_TIMEOUT; return 0; }
++    if (ready < 0) { if(error)*error=NDI_READ_ERROR; return -1; }
++    const ssize_t got = read(fd, reply, n);
++    if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
++    if (got < 0) { if(error)*error=NDI_READ_ERROR; return -1; }
++    if (!got) { if(error)*error=NDI_READ_ERROR; return -1; }
++    return int(got);
++  }
+ }
+ 
+-//----------------------------------------------------------------------------
+-ndicapiExport int ndiSerialRead(int serial_port, char* reply, int numberOfBytesToRead, bool isBinary, int* errorCode)
++ndicapiExport int ndiSerialWriteDeadline(int fd, const char* text, int n, uint64_t deadline)
+ {
+-  // Local robustness fix (2026-10-25): fragmented reads must stay within
+-  // the caller's capacity, including while assembling a binary header.
+-  int totalNumberOfBytesRead = 0;
+-  int totalNumberOfBytesToRead = numberOfBytesToRead;
+-  int numberOfBytesRead;
+-  bool binarySizeCalculated = false;
+-
+-  while (totalNumberOfBytesRead < totalNumberOfBytesToRead)
+-  {
+-    int remaining = totalNumberOfBytesToRead - totalNumberOfBytesRead;
+-    if (isBinary && !binarySizeCalculated && totalNumberOfBytesRead < 4 &&
+-        remaining > 4 - totalNumberOfBytesRead)
+-    {
+-      remaining = 4 - totalNumberOfBytesRead;
+-    }
+-    if ((numberOfBytesRead = read(serial_port, &reply[totalNumberOfBytesRead], remaining)) == -1)
+-    {
+-      if (errno == EAGAIN || errno == EINTR) /* canceled, so retry */
+-      {
+-        continue;
+-      }
+-      else
+-      {
+-        if (errorCode) { *errorCode = NDI_READ_ERROR; }
+-        return -1; /* IO error occurred */
+-      }
+-    }
+-    else if (numberOfBytesRead == 0)   /* no characters read, must have timed out */
++  NonblockingSerial nonblocking(fd);
++  if (!nonblocking.valid() || n < 0) return -1;
++  long writeDelayUs = 0;
++  const char* setting = getenv("NDICAPI_SERIAL_WRITE_DELAY_US");
++  if (setting)
++  {
++    char* end = NULL;
++    const long value = strtol(setting, &end, 10);
++    if (end != setting && *end == '\0' && value > 0 && value <= 10000) writeDelayUs = value;
++  }
++  int sent = 0;
++  while (sent < n)
++  {
++    const int ready = serialReady(fd, POLLOUT, deadline);
++    if (ready <= 0) return ready == 0 ? sent : -1;
++    const ssize_t written = write(fd, text + sent, writeDelayUs > 0 ? 1 : n - sent);
++    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
++    if (written < 0) return -1;
++    sent += int(written);
++    if (written > 0 && sent < n && writeDelayUs > 0)
+     {
+-      return 0;
++      const uint64_t wake = std::min<uint64_t>(deadline, serialNow() + uint64_t(writeDelayUs) * 1000ULL);
++      timespec until = {time_t(wake / 1000000000ULL), long(wake % 1000000000ULL)};
++      int result;
++      do { result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &until, NULL); }
++      while (result == EINTR && serialNow() < deadline);
++      if (result && result != EINTR) { errno=result; return -1; }
+     }
++  }
++  return sent;
++}
+ 
+-    totalNumberOfBytesRead += numberOfBytesRead;
+-    if ((!isBinary && reply[totalNumberOfBytesRead - 1] == '\r')      /* done when carriage return received (ASCII) or when ERROR... received (binary)*/
+-        || (isBinary && totalNumberOfBytesRead >= 5 && strncmp(reply, "ERROR", 5) == 0 && reply[totalNumberOfBytesRead - 1] == '\r'))
+-    {
+-      break;
+-    }
++ndicapiExport int ndiSerialWrite(int fd, const char* text, int n)
++{
++  return ndiSerialWriteDeadline(fd, text, n, serialDefaultDeadline(fd));
++}
+ 
+-    if (isBinary && !binarySizeCalculated && totalNumberOfBytesRead >= 4 &&
+-        reply[0] == (char)0xc4 && reply[1] == (char)0xa5)
++ndicapiExport int ndiSerialReadDeadline(int fd, char* reply, int capacity, bool binary, int* error, uint64_t deadline)
++{
++  int have = 0, want = capacity;
++  bool sizeKnown = false;
++  while (have < want)
++  {
++    int remaining = want - have;
++    if (binary && !sizeKnown && have < 4) remaining = std::min(remaining, 4 - have);
++    const int got = ndiSerialReadSomeDeadline(fd, reply + have, remaining, deadline, error);
++    if (got <= 0) return got;
++    have += got;
++    if ((!binary || (have >= 5 && !strncmp(reply,"ERROR",5))) && reply[have-1]=='\r') break;
++    if (binary && !sizeKnown && have >= 4 && (unsigned char)reply[0]==0xc4 && (unsigned char)reply[1]==0xa5)
+     {
+-      // recalculate n based on the reply length (reported from ndi device) and the amount of data received so far
+-      unsigned int size = ((unsigned char)reply[2] | (unsigned char)reply[3] << 8) + 8; // 8 bytes -> 2 for Start Sequence (a5c4), 2 for reply length, 2 for header CRC, 2 for CRC16
+-      if (size > static_cast<unsigned int>(numberOfBytesToRead))
+-      {
+-        if (errorCode) { *errorCode = NDI_BAD_REPLY; }
+-        return -1;
+-      }
+-      totalNumberOfBytesToRead = size;
+-      binarySizeCalculated = true;
++      const unsigned size = ((unsigned char)reply[2] | unsigned((unsigned char)reply[3]) << 8) + 8u;
++      if (size > unsigned(capacity)) { if(error)*error=NDI_BAD_REPLY; return -1; }
++      want = int(size); sizeKnown = true;
+     }
+   }
++  return have;
++}
+ 
+-  return totalNumberOfBytesRead;
++ndicapiExport int ndiSerialRead(int fd, char* reply, int capacity, bool binary, int* error)
++{
++  return ndiSerialReadDeadline(fd, reply, capacity, binary, error, serialDefaultDeadline(fd));
+ }
+ 
++
+ //----------------------------------------------------------------------------
+ ndicapiExport int ndiSerialSleep(int serial_port, int milliseconds)
+ {
