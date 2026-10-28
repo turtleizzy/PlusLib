@@ -29,7 +29,27 @@ PlusStatus PlusIgtlClientInfo::SetClientInfoFromXmlData(const char* strXmlData)
     return PLUS_FAIL;
   }
 
-  vtkSmartPointer<vtkXMLDataElement> xmldata = vtkSmartPointer<vtkXMLDataElement>::Take(vtkXMLUtilities::ReadElementFromString(strXmlData));
+  // Compatibility with Python ElementTree's encoding="ascii" declaration.
+  // Expat accepts the equivalent US-ASCII name; normalize the declaration only.
+  std::string xmlData(strXmlData);
+  if (xmlData.compare(0, 5, "<?xml") == 0)
+  {
+    size_t declarationEnd = xmlData.find("?>");
+    if (declarationEnd != std::string::npos)
+    {
+      for (char quote : { '\'', '"' })
+      {
+        std::string encoding = std::string("encoding=") + quote + "ascii" + quote;
+        size_t position = xmlData.find(encoding);
+        if (position < declarationEnd)
+        {
+          xmlData.replace(position, encoding.size(), std::string("encoding=") + quote + "US-ASCII" + quote);
+          break;
+        }
+      }
+    }
+  }
+  vtkSmartPointer<vtkXMLDataElement> xmldata = vtkSmartPointer<vtkXMLDataElement>::Take(vtkXMLUtilities::ReadElementFromString(xmlData.c_str()));
   if (xmldata == NULL)
   {
     LOG_ERROR("Failed to set ClientInfo - invalid xml data string: " << strXmlData);
