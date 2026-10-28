@@ -45,6 +45,11 @@ POSSIBILITY OF SUCH DAMAGES.
 #include "vtkPlusDataSource.h"
 #include "vtkPlusNDITracker.h"
 #include "PlusNDIMarkerRecorder.h"
+#include "PlusNDIRaw.h"
+#include <fstream>
+#include <cmath>
+#include <stdexcept>
+#include <time.h>
 #include <sys/stat.h>
 
 // NDI includes
@@ -133,6 +138,8 @@ vtkPlusNDITracker::~vtkPlusNDITracker()
     toolDescriptorIt->second.VirtualSROM = NULL;
   }
   if (this->MarkerRecorder) { this->MarkerRecorder->Stop(); delete this->MarkerRecorder; }
+  delete this->RawSender;
+  delete this->RawModel;
   delete this->MarkerReply;
   this->CommandMutex->Delete();
   this->CommandMutex = nullptr;
@@ -504,11 +511,13 @@ PlusStatus vtkPlusNDITracker::InternalConnectNetwork()
 PlusStatus vtkPlusNDITracker::InternalDisconnect()
 {
   PlusStatus result = PLUS_SUCCESS;
-  if (this->MarkerRecorder && !this->MarkerRecorder->Stop())
+  if (this->MarkerRecorder && !this->MarkerRecorder->Stop(this->RawSnapshotFailed?"raw snapshot allocation failure":""))
   {
     result = PLUS_FAIL;
     LOG_ERROR("Measured marker sidecar did not close completely: " << this->MarkerRecorder->Error());
   }
+  if (!this->RawStartupError.empty()) { result = PLUS_FAIL; }
+  if (this->RawSender && !this->RawSender->Stop("SOURCE_STOP")) { result = PLUS_FAIL; }
   if (!this->Device) { return result; }
   for (NdiToolDescriptorsType::iterator toolDescriptorIt = this->NdiToolDescriptors.begin(); toolDescriptorIt != this->NdiToolDescriptors.end(); ++toolDescriptorIt)
   {
@@ -555,6 +564,33 @@ PlusStatus vtkPlusNDITracker::InternalStartRecording()
       return PLUS_FAIL;
     }
     this->MarkerPollSequence = 0;
+    this->RawReplySequence=0;
+    this->RawSnapshotFailed = false;
+    if (this->EnableRawEndpoint)
+    {
+      this->RawStartupError.clear();
+      try {
+      if(this->RawProtocol!="ndi.raw.v1" || this->RawSchemaMinor!=0)throw std::invalid_argument("raw profile requires explicit RawProtocol=ndi.raw.v1 and RawSchemaMinor=0");
+      if (!this->RawModel)this->RawModel=new PlusNDIRawModel;
+      this->RawModel->NewAcquisition(this->MarkerConnectionEpoch);
+      if (!this->RawSender)this->RawSender=new PlusNDIRawSender;
+      PlusNDIRawConfig config;config.SourceId=this->RawSourceId;
+      config.ReferenceFrame=this->GetToolReferenceFrameName();
+      config.SerialEndpoint=ndiGetSerialDeviceName(this->Device);
+      config.StatusDirectory=this->MarkerSidecarDirectory;
+      config.Port=this->RawPort;config.QueueCapacity=this->RawQueueCapacity;
+      config.QueueBytes=this->RawQueueBytes;config.WriteTimeoutMs=this->RawWriteTimeoutMs;
+      config.DrainTimeoutMs=this->RawDrainTimeoutMs;config.RequestedRate=this->AcquisitionRate;
+      if (!this->RawSender->Start(config,error))
+      {
+        LOG_ERROR("Raw endpoint startup failed; existing TRANSFORM and sidecar continue: " << error);
+      }
+      this->Device->BxRawCapture=1;
+      }catch(const std::exception& e){
+        this->RawStartupError=e.what();
+        LOG_ERROR("Raw initialization failed; legacy collection continues: " << this->RawStartupError);
+      }
+    }
     this->MarkerErrorReported = false;
     LOG_INFO("Measured marker sidecar: " << this->MarkerRecorder->Directory());
   }
@@ -563,6 +599,7 @@ PlusStatus vtkPlusNDITracker::InternalStartRecording()
   if (errnum)
   {
     LOG_ERROR("Failed TSTART: " << ndiErrorString(errnum));
+    if (this->RawSender)this->RawSender->Stop("ERROR");
     if (this->MarkerRecorder) { this->MarkerRecorder->Stop("TSTART failed"); }
     CloseDevice(this->Device);
     return PLUS_FAIL;
@@ -588,8 +625,10 @@ PlusStatus vtkPlusNDITracker::InternalStopRecording()
   }
   else { result = PLUS_FAIL; }
   this->IsDeviceTracking = 0;
+  if (!this->RawStartupError.empty()) { result = PLUS_FAIL; }
+  if (this->RawSender && !this->RawSender->Stop("SOURCE_STOP")) { result = PLUS_FAIL; }
   // Always finalize, including a missing/closed device. Storage status is separate.
-  if (this->MarkerRecorder && !this->MarkerRecorder->Stop())
+  if (this->MarkerRecorder && !this->MarkerRecorder->Stop(this->RawSnapshotFailed?"raw snapshot allocation failure":""))
   {
     LOG_ERROR("Measured marker archive is incomplete: " << this->MarkerRecorder->Error());
     result = PLUS_FAIL;
@@ -602,7 +641,9 @@ PlusStatus vtkPlusNDITracker::InternalStopRecording()
 PlusStatus vtkPlusNDITracker::StopRecording()
 {
   PlusStatus result = this->Superclass::StopRecording();
-  if (this->MarkerRecorder && !this->MarkerRecorder->Stop()) { result = PLUS_FAIL; }
+  if (!this->RawStartupError.empty()) { result = PLUS_FAIL; }
+  if (this->RawSender && !this->RawSender->Stop("SOURCE_STOP")) { result = PLUS_FAIL; }
+  if (this->MarkerRecorder && !this->MarkerRecorder->Stop(this->RawSnapshotFailed?"raw snapshot allocation failure":"")) { result = PLUS_FAIL; }
   return result;
 }
 PlusStatus vtkPlusNDITracker::Disconnect()
@@ -610,7 +651,9 @@ PlusStatus vtkPlusNDITracker::Disconnect()
   PlusStatus result = PLUS_SUCCESS;
   if (this->Recording && this->StopRecording() != PLUS_SUCCESS) { result = PLUS_FAIL; }
   if (this->Superclass::Disconnect() != PLUS_SUCCESS) { result = PLUS_FAIL; }
-  if (this->MarkerRecorder && !this->MarkerRecorder->Stop()) { result = PLUS_FAIL; }
+  if (!this->RawStartupError.empty()) { result = PLUS_FAIL; }
+  if (this->RawSender && !this->RawSender->Stop("SOURCE_STOP")) { result = PLUS_FAIL; }
+  if (this->MarkerRecorder && !this->MarkerRecorder->Stop(this->RawSnapshotFailed?"raw snapshot allocation failure":"")) { result = PLUS_FAIL; }
   return result;
 }
 std::string vtkPlusNDITracker::GetMeasuredMarkerStorageState() const
@@ -1107,7 +1150,24 @@ PlusStatus vtkPlusNDITracker::ReadConfiguration(vtkXMLDataElement* rootConfigEle
   XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, NetworkPort, deviceConfig);
   XML_READ_BOOL_ATTRIBUTE_OPTIONAL(CheckDSR, deviceConfig);
 
+  this->RawStartupError.clear();
   XML_READ_BOOL_ATTRIBUTE_OPTIONAL(EnableMeasuredMarkers, deviceConfig);
+  XML_READ_BOOL_ATTRIBUTE_OPTIONAL(EnableRawEndpoint, deviceConfig);
+  XML_READ_BOOL_ATTRIBUTE_OPTIONAL(RawRecoverInitial, deviceConfig);
+  XML_READ_STRING_ATTRIBUTE_OPTIONAL(RawSourceId, deviceConfig);
+  XML_READ_STRING_ATTRIBUTE_OPTIONAL(RawProtocol, deviceConfig);
+  XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, RawSchemaMinor, deviceConfig);
+  XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, RawPort, deviceConfig);
+  XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, RawQueueCapacity, deviceConfig);
+  XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, RawQueueBytes, deviceConfig);
+  XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, RawWriteTimeoutMs, deviceConfig);
+  XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, RawDrainTimeoutMs, deviceConfig);
+  if (this->EnableRawEndpoint && !this->EnableMeasuredMarkers)
+  {
+    this->RawStartupError="Raw endpoint requires the same-BX measured-marker sidecar path";
+    LOG_ERROR(this->RawStartupError << "; raw disabled.");
+    this->EnableRawEndpoint=false;
+  }
   XML_READ_STRING_ATTRIBUTE_OPTIONAL(MarkerSidecarDirectory, deviceConfig);
   XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, MarkerQueueCapacity, deviceConfig);
   XML_READ_SCALAR_ATTRIBUTE_OPTIONAL(int, MarkerReplyTimeoutMs, deviceConfig);
@@ -1197,6 +1257,12 @@ PlusStatus vtkPlusNDITracker::ReadConfiguration(vtkXMLDataElement* rootConfigEle
           return PLUS_FAIL;
         }
       }
+      if (this->EnableRawEndpoint)
+      {
+        std::ifstream stream(romFilePath, std::ios::binary);
+        std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+        if (stream.is_open() && !stream.bad() && bytes.size()==toolDescriptor.MarkerRomBytes)toolDescriptor.MarkerRomSHA256=PlusNDIRawWire::Sha256(bytes.data(),bytes.size());
+      }
       this->ReadSromFromFile(toolDescriptor, romFilePath.c_str());
     }
 
@@ -1217,6 +1283,18 @@ PlusStatus vtkPlusNDITracker::WriteConfiguration(vtkXMLDataElement* rootConfig)
 
   if (this->EnableMeasuredMarkers)
   {
+    trackerConfig->SetAttribute("EnableRawEndpoint", this->EnableRawEndpoint?"true":"false");
+    if(this->EnableRawEndpoint){
+      trackerConfig->SetAttribute("RawSourceId", this->RawSourceId.c_str());
+      trackerConfig->SetAttribute("RawProtocol", this->RawProtocol.c_str());
+      trackerConfig->SetIntAttribute("RawSchemaMinor", this->RawSchemaMinor);
+      trackerConfig->SetAttribute("RawRecoverInitial",this->RawRecoverInitial?"true":"false");
+      trackerConfig->SetIntAttribute("RawPort", this->RawPort);
+      trackerConfig->SetIntAttribute("RawQueueCapacity", this->RawQueueCapacity);
+      trackerConfig->SetIntAttribute("RawQueueBytes", this->RawQueueBytes);
+      trackerConfig->SetIntAttribute("RawWriteTimeoutMs", this->RawWriteTimeoutMs);
+      trackerConfig->SetIntAttribute("RawDrainTimeoutMs", this->RawDrainTimeoutMs);
+    }
     trackerConfig->SetAttribute("EnableMeasuredMarkers", "true");
     trackerConfig->SetAttribute("MarkerSidecarDirectory", this->MarkerSidecarDirectory.c_str());
     trackerConfig->SetIntAttribute("MarkerQueueCapacity", this->MarkerQueueCapacity);
@@ -1688,13 +1766,39 @@ PlusStatus vtkPlusNDITracker::DoBXUpdate()
       b.RomPath = entry.second.MarkerRomPath;
       b.RomMD5 = entry.second.MarkerRomMD5;
       b.RomBytes = entry.second.MarkerRomBytes;
+      b.RomSHA256 = entry.second.MarkerRomSHA256;
       markerBindings.push_back(b);
     }
+    if (this->EnableRawEndpoint && this->RawModel && this->RawSender && this->RawStartupError.empty())
+    {
+      try {
+        if(this->RawRecoverInitial && this->RawModel->InitialRecoveryPending() && this->RawSender->PrepareInitialRecovery()==1){
+          PlusNDIRawRecoveryEvidence evidence{};evidence.EndSentNs=this->RawSender->RecoveryEndSentNs();
+          const bool recovered=this->RecoverRawSerial(evidence)==PLUS_SUCCESS;
+          const bool recorded=this->RawSender->RecordRecoveryEvidence(evidence);
+          // INIT may assign different handles. Rebuild from the restored descriptors.
+          markerBindings.clear();
+          for(const auto& entry:this->NdiToolDescriptors){
+            PlusNDIMarkerBinding b;b.Handle=entry.second.PortHandle;b.TransformName=entry.first;
+            b.BodyFrame=entry.second.MarkerBodyFrame;b.RomPath=entry.second.MarkerRomPath;
+            b.RomMD5=entry.second.MarkerRomMD5;b.RomBytes=entry.second.MarkerRomBytes;
+            b.RomSHA256=entry.second.MarkerRomSHA256;markerBindings.push_back(b);
+          }
+          if(!recovered||!recorded||!this->RawSender->CommitInitialRecovery(*this->RawModel,markerBindings,evidence)){
+            this->RawModel->MarkFailed();this->MarkerTransportDesynchronized=true;this->RawStartupError="Verified serial recovery failed; raw remains quarantined";return PLUS_FAIL;
+          }
+          this->RawReplySequence=0;
+        }
+        ++this->RawReplySequence;
+        this->RawModel->PrepareBindings(markerBindings,this->MarkerConnectionEpoch);
+        this->RawSender->BeginAttempt(this->RawReplySequence,markerBindings,*this->RawModel);
+      }catch(...) { this->RawSnapshotFailed=true;this->RawModel->MarkFailed(); }
+    }
+    ++this->MarkerPollSequence;
     {
       igsioLockGuard<vtkIGSIORecursiveCriticalSection> lock(this->CommandMutex);
       errnum = ndiCaptureBX(this->Device, NDI_BX_CAPTURE_FLAGS, this->MarkerReplyTimeoutMs, this->MarkerReply);
     }
-    ++this->MarkerPollSequence;
     if (this->MarkerReply->transport_state == NDI_BX_RECONNECT_REQUIRED)
     {
       this->MarkerTransportDesynchronized = true;
@@ -1770,7 +1874,8 @@ PlusStatus vtkPlusNDITracker::DoBXUpdate()
         const auto& tool = this->MarkerReply->tools[i];
         if (tool.handle != static_cast<unsigned>(portHandle)) { continue; }
         if (tool.frame_available) { ndiPortStatus = tool.port_status; ndiFrameIndex = tool.frame_number; }
-        if (tool.pose_present) { std::copy(tool.pose, tool.pose + 8, ndiTransform); ndiToolAbsent = 0; }
+        bool finite=true;for(float f:tool.pose)finite=finite&&std::isfinite(f);
+        if (tool.pose_present && finite) { std::copy(tool.pose, tool.pose + 8, ndiTransform); ndiToolAbsent = 0; }
         break;
       }
     }
@@ -2017,11 +2122,64 @@ PlusStatus vtkPlusNDITracker::ProbeSerialInternal()
 // Opt-in only; formatting and all file I/O are performed by the recorder worker.
 void vtkPlusNDITracker::RecordMeasuredMarkers(const std::vector<PlusNDIMarkerBinding>& bindings)
 {
-  bool accepted = this->MarkerRecorder && this->MarkerReply &&
+  bool accepted=false;
+  if (this->EnableRawEndpoint && this->RawModel && this->RawSender && this->RawStartupError.empty())
+  {
+    try {
+      const auto snapshot=this->RawModel->Seal(*this->MarkerReply,bindings,this->MarkerConnectionEpoch,this->RawReplySequence,this->MarkerPollSequence);
+      this->RawSender->Enqueue(snapshot);
+      accepted=this->MarkerRecorder->Enqueue(snapshot);
+    }catch(...) {
+      this->RawSnapshotFailed=true;
+      this->RawModel->MarkFailed();
+      this->RawSender->Enqueue(nullptr);
+      accepted=this->MarkerRecorder->Enqueue(*this->MarkerReply,bindings,this->MarkerConnectionEpoch,this->MarkerPollSequence);
+    }
+  }
+  else accepted = this->MarkerRecorder && this->MarkerReply &&
     this->MarkerRecorder->Enqueue(*this->MarkerReply, bindings, this->MarkerConnectionEpoch, this->MarkerPollSequence);
   if ((!accepted || !this->MarkerRecorder->Healthy()) && !this->MarkerErrorReported)
   {
     LOG_ERROR("Measured marker sidecar lost records or failed; inspect its counters/summary. Tool TRANSFORM updates continue.");
     this->MarkerErrorReported = true;
   }
+}
+
+std::string vtkPlusNDITracker::GetRawEndpointState() const
+{ return !this->RawStartupError.empty()?"startup_failed":this->RawSender?this->RawSender->State():"disabled"; }
+std::string vtkPlusNDITracker::GetRawEndpointError() const
+{ return !this->RawStartupError.empty()?this->RawStartupError:this->RawSender?this->RawSender->Error():std::string(); }
+
+// Explicit, same-owner serial recovery. No BX polling is added. A new raw
+// acquisition is committed only after the exact reset token and all setup ACKs.
+PlusStatus vtkPlusNDITracker::RecoverRawSerial(PlusNDIRawRecoveryEvidence& proof)
+{
+  auto mono=[](){timespec t{};clock_gettime(CLOCK_MONOTONIC,&t);return uint64_t(t.tv_sec)*1000000000ULL+t.tv_nsec;};
+  proof.StartNs=mono();proof.OldConnection=this->MarkerConnectionEpoch;
+  auto finish=[&](const char* error){proof.DoneNs=mono();std::snprintf(proof.Error,sizeof(proof.Error),"%s",error);return PLUS_FAIL;};
+  igsioLockGuard<vtkIGSIORecursiveCriticalSection> lock(this->CommandMutex);
+  if(!this->Device)return finish("device unavailable");
+  if(ndiBXResetForRecovery(this->Device,7000,&proof.Reset)!=NDI_OKAY)return finish("full reset token not verified");
+  this->IsDeviceTracking=0;
+  const char* reply=ndiINIT(this->Device);proof.InitOK=ndiGetError(this->Device)==NDI_OKAY&&reply&&!std::strcmp(reply,"OKAY");
+  std::snprintf(proof.InitReply,sizeof(proof.InitReply),"%s",this->Device->Reply);
+  if(!proof.InitOK)return finish("INIT acknowledgement failed");
+  int baud=vtkPlusNDITracker::ConvertBaudToNDIEnum(this->BaudRate);
+  if(baud<0)return finish("unsupported configured baud");
+  reply=ndiCommand(this->Device,"COMM:%X%03d%d",baud,NDI_8N1,NDI_NOHANDSHAKE);
+  proof.CommOK=ndiGetError(this->Device)==NDI_OKAY&&reply&&!std::strcmp(reply,"OKAY");
+  std::snprintf(proof.CommReply,sizeof(proof.CommReply),"%s",this->Device->Reply);
+  if(!proof.CommOK)return finish("COMM acknowledgement failed");
+  proof.ConfigurationOK=this->GetFirmwareRevision()==PLUS_SUCCESS&&this->FirmwareMajorRevision<3&&
+    this->SelectDataAveraging()==PLUS_SUCCESS&&this->SelectMeasurementVolume()==PLUS_SUCCESS&&this->SelectTrackingFrequency()==PLUS_SUCCESS;
+  if(!proof.ConfigurationOK)return finish("configured device profile could not be restored");
+  proof.PortsOK=this->EnableToolPorts()==PLUS_SUCCESS;
+  if(!proof.PortsOK)return finish("ROM and tool enable verification failed");
+  reply=ndiTSTART(this->Device);proof.StartOK=ndiGetError(this->Device)==NDI_OKAY&&reply&&!std::strcmp(reply,"OKAY");
+  std::snprintf(proof.StartReply,sizeof(proof.StartReply),"%s",this->Device->Reply);
+  if(!proof.StartOK)return finish("TSTART acknowledgement failed");
+  ++this->MarkerConnectionEpoch;proof.NewConnection=this->MarkerConnectionEpoch;
+  this->Device->BxCaptureSynchronization=1;this->IsDeviceTracking=1;
+  this->MarkerRequestUnsupported=this->MarkerTransportDesynchronized=false;
+  proof.Success=true;proof.DoneNs=mono();return PLUS_SUCCESS;
 }

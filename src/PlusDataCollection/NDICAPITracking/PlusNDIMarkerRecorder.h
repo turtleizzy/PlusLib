@@ -11,7 +11,8 @@
 struct PlusNDIMarkerBinding
 {
   unsigned int Handle=0;
-  std::string TransformName,BodyFrame,RomPath,RomMD5;
+  std::string TransformName,BodyFrame,RomPath,RomMD5,RomSHA256;
+  uint64_t RawBindingEpoch=1;
   uint64_t RomBytes=0;
   bool Published=false;
   double Matrix[16]={0};
@@ -19,6 +20,7 @@ struct PlusNDIMarkerBinding
   unsigned long PlusFrame=0;
   double PlusHostTime=0;
 };
+struct PlusNDISnapshot;
 class vtkPlusDataCollectionExport PlusNDIMarkerRecorder
 {
 public:
@@ -27,6 +29,7 @@ public:
   bool Start(const std::string& parent,const std::string& tracker,unsigned capacity,
              double requestedRate,unsigned requestedBaud,std::string& error,const std::string& sourceEndpoint="");
   bool Enqueue(const ndiBXCapture&,const std::vector<PlusNDIMarkerBinding>&,uint64_t epoch,uint64_t poll);
+  bool Enqueue(const std::shared_ptr<const PlusNDISnapshot>&);
   bool Stop(const std::string& failure="");
   bool Healthy()const;
   std::string Error()const;

@@ -53,6 +53,9 @@ struct ndicapi;
 struct ndiBXCapture;
 struct PlusNDIMarkerBinding;
 class PlusNDIMarkerRecorder;
+class PlusNDIRawSender;
+class PlusNDIRawModel;
+struct PlusNDIRawRecoveryEvidence;
 
 // the maximum size of an NDI reply (excluding new extended binary format)
 #define VTK_NDI_REPLY_LEN 2048
@@ -111,7 +114,7 @@ class vtkPlusDataCollectionExport vtkPlusNDITracker : public vtkPlusDevice
     int             WiredPortNumber;  // >= 0 for wired tools
     unsigned char*  VirtualSROM;      // nonzero for wireless tools
     bool            PortEnabled;      // true if the tool is successfully enabled in the tracker
-    std::string     MarkerBodyFrame, MarkerRomPath, MarkerRomMD5;
+    std::string     MarkerBodyFrame, MarkerRomPath, MarkerRomMD5, MarkerRomSHA256;
     uint64_t MarkerRomBytes = 0;
     int             PortHandle;       // this number identifies the tool in the tracker
   };
@@ -123,6 +126,16 @@ public:
   static vtkPlusNDITracker* New();
   vtkTypeMacro(vtkPlusNDITracker, vtkPlusDevice);
   void PrintSelf(ostream& os, vtkIndent indent);
+  vtkSetMacro(EnableRawEndpoint, bool);
+  vtkSetStdStringMacro(RawSourceId);
+  vtkSetStdStringMacro(RawProtocol);
+  vtkSetMacro(RawSchemaMinor,int);
+  vtkSetMacro(RawRecoverInitial,bool);
+  vtkSetMacro(RawPort,int);
+  vtkSetMacro(RawQueueCapacity,int);
+  vtkSetMacro(RawQueueBytes,int);
+  vtkSetMacro(RawWriteTimeoutMs,int);
+  vtkSetMacro(RawDrainTimeoutMs,int);
   vtkSetMacro(EnableMeasuredMarkers, bool);
   vtkGetMacro(EnableMeasuredMarkers, bool);
   vtkSetStdStringMacro(MarkerSidecarDirectory);
@@ -133,6 +146,8 @@ public:
   // Independent archive lifecycle, never a measurement-validity flag.
   std::string GetMeasuredMarkerStorageState() const;
   std::string GetMeasuredMarkerStorageError() const;
+  std::string GetRawEndpointState() const;
+  std::string GetRawEndpointError() const;
 
 
   /*! Flags for tool LEDs */
@@ -347,6 +362,15 @@ protected:
   vtkGetMacro(FirmwareMinorRevision, uint32_t);
 
 protected:
+  PlusStatus RecoverRawSerial(PlusNDIRawRecoveryEvidence&);
+  bool RawRecoverInitial=false;
+  uint64_t RawReplySequence=0;
+  bool EnableRawEndpoint=false, RawSnapshotFailed=false;
+  std::string RawSourceId,RawStartupError,RawProtocol;
+  int RawSchemaMinor=-1;
+  int RawPort=18945,RawQueueCapacity=64,RawQueueBytes=16777216,RawWriteTimeoutMs=500,RawDrainTimeoutMs=2000;
+  PlusNDIRawSender* RawSender=nullptr;
+  PlusNDIRawModel* RawModel=nullptr;
   bool EnableMeasuredMarkers;
   std::string MarkerSidecarDirectory;
   int MarkerQueueCapacity, MarkerReplyTimeoutMs;

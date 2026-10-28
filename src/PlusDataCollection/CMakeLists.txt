@@ -374,6 +374,7 @@ ENDIF()
 # NDI Certus support
 IF(PLUS_USE_NDI_CERTUS)
   FIND_PACKAGE(ndicapi REQUIRED NO_MODULE)
+  FIND_PACKAGE(OpenSSL REQUIRED COMPONENTS Crypto)
 
   SET(NDICertus_SRCS
     NDICertusTracking/vtkPlusNDICertusTracker.cxx
@@ -399,6 +400,7 @@ IF(PLUS_USE_NDI_CERTUS)
   LIST(APPEND ${PROJECT_NAME}_LIBS
     ${NDIOAPI_LIBRARY}
     ndicapi
+    OpenSSL::Crypto
     )
 
   GET_TARGET_PROPERTY(_lib_release ndicapi IMPORTED_LOCATION_RELEASE)
@@ -423,15 +425,18 @@ ENDIF()
 # NDI COMMON API support
 IF(PLUS_USE_NDI)
   FIND_PACKAGE(ndicapi REQUIRED NO_MODULE)
+  FIND_PACKAGE(OpenSSL REQUIRED COMPONENTS Crypto)
 
   SET(NDICAPI_SRCS
     NDICAPITracking/vtkPlusNDITracker.cxx
     NDICAPITracking/PlusNDIMarkerRecorder.cxx
+    NDICAPITracking/PlusNDIRaw.cxx
     )
 
   SET(NDICAPI_HDRS
     NDICAPITracking/vtkPlusNDITracker.h
     NDICAPITracking/PlusNDIMarkerRecorder.h
+    NDICAPITracking/PlusNDIRaw.h
     )
 
   LIST(APPEND ${PROJECT_NAME}_HDRS
@@ -448,6 +453,7 @@ IF(PLUS_USE_NDI)
 
   LIST(APPEND ${PROJECT_NAME}_LIBS
     ndicapi
+    OpenSSL::Crypto
     )
 
   SET(_entries)

@@ -1,5 +1,6 @@
 /* Local measured-marker recorder. See Plus License.txt. */
 #include "PlusNDIMarkerRecorder.h"
+#include "PlusNDIRaw.h"
 #include <vtksys/MD5.h>
 #include <atomic>
 #include <cmath>
@@ -56,7 +57,13 @@ J rom(const PlusNDIMarkerBinding& b){
     .add("content_hash_algorithm",J("md5")).add("content_hash",J(b.RomMD5))
     .add("scope",J("original_file_bytes_not_ROM_geometry"));
 }
-struct Packet {ndiBXCapture Reply;std::vector<PlusNDIMarkerBinding> Bindings;uint64_t Epoch,Sequence;};
+struct Packet {ndiBXCapture Reply;std::vector<PlusNDIMarkerBinding> Bindings;uint64_t Epoch=0,Sequence=0;
+ std::shared_ptr<const PlusNDISnapshot> Snapshot;
+ const ndiBXCapture& reply()const{return Snapshot?Snapshot->Reply:Reply;}
+ const std::vector<PlusNDIMarkerBinding>& bindings()const{return Snapshot?Snapshot->Bindings:Bindings;}
+ uint64_t epoch()const{return Snapshot?Snapshot->Epoch:Epoch;}
+ uint64_t sequence()const{return Snapshot?Snapshot->LegacySequence:Sequence;}
+};
 struct FrameState {unsigned Handle=0,Frame=0;uint64_t Connection=0,Binding=0,CounterEpoch=1;bool HaveFrame=false;std::string Rom,Block;};
 }
 struct PlusNDIMarkerRecorder::Impl
@@ -129,7 +136,9 @@ struct PlusNDIMarkerRecorder::Impl
       .add("counter_wraps",J::integer(Wraps)).add("counter_reset_or_out_of_order",J::integer(Resets));
   }
   J tool(const Packet& p,const PlusNDIMarkerBinding& b,const ndiBXCapturedTool* t){
-    bool have=t&&p.Reply.valid;
+    bool have=t&&(p.reply().valid||(p.Snapshot&&p.reply().reply_decoded));
+    const PlusNDIRawToolState* meta=nullptr;
+    if(p.Snapshot)for(size_t i=0;i<p.Snapshot->Bindings.size();++i)if(p.Snapshot->Bindings[i].Handle==b.Handle&&p.Snapshot->Bindings[i].TransformName==b.TransformName){meta=&p.Snapshot->ToolStates[i];break;}
     J o=J::object();
     o.add("handle",b.Handle?J::integer(b.Handle):J()).add("transform_name",b.TransformName.empty()?J():J(b.TransformName))
       .add("body_frame",b.BodyFrame.empty()?J():J(b.BodyFrame)).add("rom",rom(b))
@@ -140,12 +149,20 @@ struct PlusNDIMarkerRecorder::Impl
       .add("frame_number_bits",J::integer(32)).add("frame_modulus",J::integer(4294967296ULL));
     std::string key=b.TransformName.empty()?"unknown-handle-"+std::to_string(b.Handle):b.TransformName;
     auto& s=States[key];
-    if(s.Connection!=p.Epoch||s.Handle!=b.Handle||s.Rom!=b.RomMD5||Owners[b.Handle]!=key){
-      s=FrameState();s.Connection=p.Epoch;s.Handle=b.Handle;s.Rom=b.RomMD5;s.Binding=++NextBinding;Owners[b.Handle]=key;
-    }
     std::string classification="unavailable";J fresh,delta;bool changed=false;
+    if(meta){
+      s.Binding=meta->BindingEpoch;s.CounterEpoch=meta->CounterEpoch;
+      const auto& c=meta->Classification;
+      classification=c=="FIRST"?"first_frame":c=="NEW"?"new_frame":c=="REPEAT"?"repeated_frame":c=="WRAP_CANDIDATE"?"counter_wrap":c=="RESET_OR_OUT_OF_ORDER"?"counter_reset_or_out_of_order":"unavailable";
+      fresh=meta->HaveNew?J::boolean(meta->IsNew):J();delta=meta->HaveDelta?J::integer(meta->Delta):J();changed=meta->Changed;
+      if(c=="REPEAT")++Repeats;if(c=="WRAP_CANDIDATE")++Wraps;if(c=="RESET_OR_OUT_OF_ORDER")++Resets;
+      o.add("raw_counter_classification",J(c)).add("raw_recovery_state",J(p.Snapshot->Quarantined||meta->Quarantined?"QUARANTINED":"SYNCHRONIZED"));
+    }else {
+    if(s.Connection!=p.epoch()||s.Handle!=b.Handle||s.Rom!=b.RomMD5||Owners[b.Handle]!=key){
+      s=FrameState();s.Connection=p.epoch();s.Handle=b.Handle;s.Rom=b.RomMD5;s.Binding=++NextBinding;Owners[b.Handle]=key;
+    }
     if(have&&t->frame_available){
-      std::string block(reinterpret_cast<const char*>(p.Reply.raw+t->wire_offset),t->wire_length);
+      std::string block(reinterpret_cast<const char*>(p.reply().raw+t->wire_offset),t->wire_length);
       if(!s.HaveFrame){classification="first_frame";fresh=J::boolean(true);}
       else {uint32_t d=t->frame_number-s.Frame;delta=J::integer(d);
         if(!d){classification="repeated_frame";fresh=J::boolean(false);changed=block!=s.Block;++Repeats;}
@@ -153,6 +170,7 @@ struct PlusNDIMarkerRecorder::Impl
         else{classification="counter_reset_or_out_of_order";++s.CounterEpoch;++Resets;}
       }
       s.HaveFrame=true;s.Frame=t->frame_number;s.Block=block;
+    }
     }
     o.add("binding_epoch",J::integer(s.Binding)).add("counter_epoch",J::integer(s.CounterEpoch))
       .add("frame_classification",J(classification)).add("is_new_device_frame",fresh).add("device_counter_delta",delta)
@@ -188,7 +206,7 @@ struct PlusNDIMarkerRecorder::Impl
           .add("detected",J::boolean(status!=0)).add("xyz_mm",m&&m->finite?floats(m->xyz,3):J())
           .add("out_of_volume",m?J::boolean(m->out_of_volume):J())
           .add("used_for_tool_pose",J::boolean(status==3||status==4))
-          .add("sample_valid",J::boolean(m&&m->finite&&!m->out_of_volume&&status==3)).add("state",J(state)));
+          .add("sample_valid",J::boolean(m&&m->finite&&!m->out_of_volume&&status==3&&(!p.Snapshot||(!p.Snapshot->Quarantined&&meta&&!meta->Quarantined)))).add("state",J(state)));
       }
     }
     if(have&&!t->marker_identity_known)for(unsigned j=0;j<t->marker_count;++j){
@@ -199,9 +217,9 @@ struct PlusNDIMarkerRecorder::Impl
     return o.add("markers",markers).add("unidentified_measured_positions",unknown);
   }
   std::string serialize(const Packet& p){
-    const auto& r=p.Reply;if(r.transport_state==NDI_BX_FIRST_REPLY_QUARANTINED)++Quarantined;else if(!r.valid)++ErrorReplies;
+    const auto& r=p.reply();if(r.transport_state==NDI_BX_FIRST_REPLY_QUARANTINED)++Quarantined;else if(!r.valid)++ErrorReplies;
     J o=prefix("measurement_reply");
-    o.add("connection_epoch",J::integer(p.Epoch)).add("host_poll_sequence",J::integer(p.Sequence))
+    o.add("connection_epoch",J::integer(p.epoch())).add("host_poll_sequence",J::integer(p.sequence()))
       .add("reply_flags",J::integer(r.reply_flags)).add("reply_valid",J::boolean(r.valid))
       .add("reply_decoded",J::boolean(r.reply_decoded)).add("request_sent",J::boolean(r.request_sent))
       .add("transport_state",J(r.transport_state==NDI_BX_RECONNECT_REQUIRED?"reconnect_required":(r.transport_state==NDI_BX_FIRST_REPLY_QUARANTINED?"first_reply_quarantined":(r.transport_state==NDI_BX_ORDERED_UNVERIFIED?"serialized_order_assumed":"decoder_only_no_transport"))))
@@ -221,13 +239,20 @@ struct PlusNDIMarkerRecorder::Impl
       .add("coordinate_source",J("NDI_BX_0008_measured_float32_in_position_sensor_frame")).add("units",J("mm"))
       .add("system_status",r.valid?J::integer(r.system_status):J());
     J tools=J::array();std::vector<bool> mapped(r.tool_count,false);
-    for(const auto& b:p.Bindings){
+    for(const auto& b:p.bindings()){
       const ndiBXCapturedTool* t=nullptr;
       for(unsigned i=0;i<r.tool_count;++i)if(r.tools[i].handle==b.Handle){t=&r.tools[i];mapped[i]=true;}
       tools.append(tool(p,b,t));
     }
     for(unsigned i=0;i<r.tool_count;++i)if(!mapped[i]){PlusNDIMarkerBinding b;b.Handle=r.tools[i].handle;tools.append(tool(p,b,&r.tools[i]));}
-    return o.add("tools",tools).add("recorder_counters",counters()).dump()+"\n";
+    o.add("tools",tools).add("recorder_counters",counters());
+    if(p.Snapshot){
+      J data;data.s=PlusNDIRawWire::Data(*p.Snapshot);
+      o.add("frame_id",J(p.Snapshot->AcquisitionId+":"+std::to_string(p.Snapshot->Sequence)))
+       .add("reply_seq",J(std::to_string(p.Snapshot->Sequence))).add("acquisition_id",J(p.Snapshot->AcquisitionId))
+       .add("clock_domain_id",J(p.Snapshot->ClockDomainId)).add("raw_v1_snapshot_data",data);
+    }
+    return o.dump()+"\n";
   }
   void worker(){
     for(;;){
@@ -304,6 +329,30 @@ bool PlusNDIMarkerRecorder::Enqueue(const ndiBXCapture& reply,const std::vector<
   ++P->Attempted;
   std::unique_ptr<Packet> p;
   try{p.reset(new Packet);p->Reply=reply;p->Bindings=bindings;p->Epoch=epoch;p->Sequence=sequence;}
+  catch(...){++P->DropAllocation;return false;}
+  std::unique_lock<std::mutex> lock(P->Mutex,std::try_to_lock);
+  if(!lock.owns_lock()){++P->DropBusy;return false;}
+  if(!P->Accepting||P->Failed){++P->Rejected;return false;}
+  if(P->Queue.size()>=P->Capacity){++P->DropFull;return false;}
+  try{P->Queue.push_back(std::move(p));}
+  catch(...){++P->DropAllocation;return false;}
+  ++P->Enqueued;lock.unlock();P->Ready.notify_one();return true;
+}
+bool PlusNDIMarkerRecorder::Enqueue(const std::shared_ptr<const PlusNDISnapshot>& snapshot){
+  // A call belongs to this session iff it enters the gate before Stop seals it.
+  // Calls after the seal return false without mutating finalized session counters.
+  uint64_t gate=P->ProducerGate.load(std::memory_order_acquire);
+  do {if(gate&Impl::Closed){++P->OutsideSession;return false;}}
+  while(!P->ProducerGate.compare_exchange_weak(gate,gate+1,std::memory_order_acq_rel));
+  struct ProducerExit {Impl* State;~ProducerExit(){
+    // Pair the final count transition with Stop's CV mutex: a notification
+    // outside this mutex can be lost between the predicate check and wait.
+    std::lock_guard<std::mutex> lock(State->Mutex);
+    State->ProducerGate.fetch_sub(1,std::memory_order_acq_rel);State->Ready.notify_all();
+  }} producer{P.get()};
+  ++P->Attempted;
+  std::unique_ptr<Packet> p;
+  try{p.reset(new Packet);p->Snapshot=snapshot;}
   catch(...){++P->DropAllocation;return false;}
   std::unique_lock<std::mutex> lock(P->Mutex,std::try_to_lock);
   if(!lock.owns_lock()){++P->DropBusy;return false;}
